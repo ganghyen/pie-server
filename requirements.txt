@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+aiomysql
+apscheduler
+pydantic
+python-Levenshtein
