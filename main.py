@@ -32,4 +32,4 @@ app.include_router(gate.router,    prefix="/api")  # POST /api/check-plate, /api
 
 @app.get("/")
 async def root():
-    return {"message": "스마트 주차 관리 FastAPI 서버 동작 중"}
+    return {"message": "스마트 주차 관리 FastAPI 서버 동작 중 "}
