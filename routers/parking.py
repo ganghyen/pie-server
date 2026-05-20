@@ -1,7 +1,5 @@
 # ============================================================
-# 주차 이벤트 라우터 (파이 → 서버)
-# 입차 / 출차 / 번호판 업데이트
-# parking_zone: current_car_number 컬럼 사용 (앱 팀 요청 형식)
+# 주차 이벤트 라우터 (파이 → FastAPI → Spring Boot)
 # ============================================================
 
 from fastapi import APIRouter, HTTPException
@@ -9,10 +7,10 @@ from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
 import Levenshtein
-from config import PLATE_MATCH_THRESHOLD
+import httpx
+from config import SPRING_API, PLATE_MATCH_THRESHOLD
 
 router = APIRouter()
-pool   = None
 
 
 # ── OCR 오인식 보정 ───────────────────────────────────────
@@ -20,20 +18,29 @@ async def match_plate(ocr_plate: str) -> str:
     if not ocr_plate:
         return ocr_plate
 
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute("SELECT c_number FROM car")
-            rows = await cur.fetchall()
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(SPRING_API["cars"], timeout=3)
+            data = response.json()
 
-    if not rows:
+            # ⚠️ 수정 필요: Spring Boot가 반환하는 형식에 맞게 수정
+            # 현재: [{"c_number": "12가1234"}, ...]
+            # Spring Boot 응답 형식이 다르면 아래 줄 수정
+            registered = [car["c_number"] for car in data]
+
+    except Exception as e:
+        print(f"[PlateMatch] 차량 목록 조회 실패: {e} → 원본 사용")
         return ocr_plate
 
-    registered = [row[0] for row in rows]
+    if not registered:
+        return ocr_plate
 
+    # 완전 일치
     if ocr_plate in registered:
         print(f"[PlateMatch] 완전 일치: {ocr_plate}")
         return ocr_plate
 
+    # 유사도 비교
     best_distance = float("inf")
     for reg in registered:
         distance = Levenshtein.distance(ocr_plate, reg)
@@ -41,14 +48,16 @@ async def match_plate(ocr_plate: str) -> str:
             best_distance = distance
 
     same_distance = [r for r in registered if Levenshtein.distance(ocr_plate, r) == best_distance]
+
+    # 후보 2개 이상 → NULL 처리
     if len(same_distance) >= 2:
-        print(f"[PlateMatch] 후보 다수: {same_distance} → 원본 사용")
-        return ocr_plate
+        print(f"[PlateMatch] 후보 다수: {same_distance} → NULL 처리")
+        return None
 
     best_plate = same_distance[0]
 
     if best_distance <= PLATE_MATCH_THRESHOLD:
-        print(f"[PlateMatch] 오인식 보정: {ocr_plate} → {best_plate} (거리:{best_distance})")
+        print(f"[PlateMatch] 오인식 보정: {ocr_plate} → {best_plate}")
         return best_plate
     else:
         print(f"[PlateMatch] 매칭 실패: {ocr_plate} → 원본 사용")
@@ -60,13 +69,12 @@ class ParkingEvent(BaseModel):
     event:       str
     zone:        str
     plate:       Optional[str] = None
-    park_status: Optional[str] = "normal"
+    park_type:   Optional[str] = "normal"
     linked_zone: Optional[str] = None
     entry_time:  Optional[str] = None
     exit_time:   Optional[str] = None
 
 
-# ── 이벤트 수신 ───────────────────────────────────────────
 @router.post("/event")
 async def receive_event(event: ParkingEvent):
     if event.event == "entry":
@@ -84,99 +92,91 @@ async def handle_entry(event: ParkingEvent):
     entry_time    = event.entry_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     matched_plate = await match_plate(event.plate) if event.plate else None
 
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
+    try:
+        async with httpx.AsyncClient() as client:
 
-            # parking_status INSERT
-            await cur.execute("""
-                INSERT INTO parking_status
-                    (status_zone, status_plate, status_park_type,
-                     status_linked_zone, status_entry_time)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (event.zone, matched_plate, event.park_status,
-                  event.linked_zone, entry_time))
+            # 1. 구역 현재 상태 확인
+            # ⚠️ 수정 필요: Spring Boot 응답 형식에 맞게 수정
+            # 현재: {"status_type": "occupied"} 형식 기대
+            res = await client.get(
+                f"{SPRING_API['zone_status']}/{event.zone}",
+                timeout=3
+            )
+            zone_data = res.json()
 
-            # parking_zone UPDATE (area_number 기준, current_car_number 사용)
-            await cur.execute("""
-                UPDATE parking_zone
-                SET status = 'occupied',
-                    current_car_number = %s,
-                    status_change_reason = '입차'
-                WHERE area_number = %s
-            """, (matched_plate, event.zone))
+            # ⚠️ 수정 필요: Spring Boot 응답의 상태값 키 확인
+            # 현재: zone_data.get("status_type") 로 확인
+            if zone_data.get("status_type") == "occupied":
+                print(f"[ENTRY] {event.zone} 이미 주차중 → 오류 처리")
+                return {"result": "error", "message": f"{event.zone} 이미 주차중"}
 
-        await conn.commit()
+            # 2. 입차 저장 요청
+            # ⚠️ 수정 필요: Spring Boot가 받는 JSON 형식에 맞게 수정
+            await client.post(
+                SPRING_API["entry"],
+                json={
+                    "zone":        event.zone,       # 주차구역
+                    "plate":       matched_plate,     # 차량번호 (NULL 가능)
+                    "park_type":   event.park_type,  # 주차유형
+                    "linked_zone": event.linked_zone, # 2칸주차 연결구역
+                    "entry_time":  entry_time,        # 입차시간
+                },
+                timeout=3,
+            )
 
-    print(f"[ENTRY] {event.zone} | OCR:{event.plate} → 저장:{matched_plate}")
-    return {"result": "ok", "event": "entry", "zone": event.zone,
-            "ocr_plate": event.plate, "saved_plate": matched_plate}
+        print(f"[ENTRY] {event.zone} | OCR:{event.plate} → 저장:{matched_plate}")
+        return {"result": "ok", "event": "entry", "zone": event.zone,
+                "ocr_plate": event.plate, "saved_plate": matched_plate}
+
+    except Exception as e:
+        print(f"[ENTRY] Spring Boot 전달 실패: {e}")
+        raise HTTPException(status_code=500, detail="Spring Boot 전달 실패")
 
 
 # ── 출차 ──────────────────────────────────────────────────
 async def handle_exit(event: ParkingEvent):
     exit_time = event.exit_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
+    try:
+        async with httpx.AsyncClient() as client:
+            # ⚠️ 수정 필요: Spring Boot가 받는 JSON 형식에 맞게 수정
+            await client.post(
+                SPRING_API["exit"],
+                json={
+                    "zone":      event.zone,     # 주차구역
+                    "exit_time": exit_time,       # 출차시간
+                },
+                timeout=3,
+            )
 
-            # parking_status 에서 정보 가져오기
-            await cur.execute("""
-                SELECT status_plate, status_park_type, status_entry_time
-                FROM parking_status
-                WHERE status_zone = %s
-                ORDER BY status_entry_time DESC
-                LIMIT 1
-            """, (event.zone,))
-            row = await cur.fetchone()
+        print(f"[EXIT] {event.zone}")
+        return {"result": "ok", "event": "exit", "zone": event.zone}
 
-            plate      = row[0] if row else event.plate
-            park_type  = row[1] if row else "normal"
-            entry_time = row[2] if row else None
-
-            # parking_status DELETE
-            await cur.execute("DELETE FROM parking_status WHERE status_zone = %s", (event.zone,))
-
-            # parking_history INSERT
-            await cur.execute("""
-                INSERT INTO parking_history
-                    (history_zone, history_plate, history_park_type,
-                     history_entry_time, history_exit_time)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (event.zone, plate, park_type, entry_time, exit_time))
-
-            # parking_zone UPDATE → empty
-            await cur.execute("""
-                UPDATE parking_zone
-                SET status = 'empty',
-                    current_car_number = NULL,
-                    status_change_reason = '출차'
-                WHERE area_number = %s
-            """, (event.zone,))
-
-        await conn.commit()
-
-    print(f"[EXIT] {event.zone} | {plate}")
-    return {"result": "ok", "event": "exit", "zone": event.zone}
+    except Exception as e:
+        print(f"[EXIT] Spring Boot 전달 실패: {e}")
+        raise HTTPException(status_code=500, detail="Spring Boot 전달 실패")
 
 
 # ── 번호판 업데이트 ───────────────────────────────────────
 async def handle_update(event: ParkingEvent):
     matched_plate = await match_plate(event.plate) if event.plate else None
 
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute("""
-                UPDATE parking_status SET status_plate = %s
-                WHERE status_zone = %s
-            """, (matched_plate, event.zone))
+    try:
+        async with httpx.AsyncClient() as client:
+            # ⚠️ 수정 필요: Spring Boot가 받는 JSON 형식에 맞게 수정
+            await client.post(
+                SPRING_API["update_plate"],
+                json={
+                    "zone":  event.zone,    # 주차구역
+                    "plate": matched_plate, # 차량번호
+                },
+                timeout=3,
+            )
 
-            await cur.execute("""
-                UPDATE parking_zone SET current_car_number = %s
-                WHERE area_number = %s
-            """, (matched_plate, event.zone))
+        print(f"[UPDATE] {event.zone} | OCR:{event.plate} → 저장:{matched_plate}")
+        return {"result": "ok", "event": "update", "zone": event.zone,
+                "ocr_plate": event.plate, "saved_plate": matched_plate}
 
-        await conn.commit()
-
-    print(f"[UPDATE] {event.zone} | OCR:{event.plate} → 저장:{matched_plate}")
-    return {"result": "ok", "event": "update", "zone": event.zone,
-            "ocr_plate": event.plate, "saved_plate": matched_plate}
+    except Exception as e:
+        print(f"[UPDATE] Spring Boot 전달 실패: {e}")
+        raise HTTPException(status_code=500, detail="Spring Boot 전달 실패")

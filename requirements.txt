@@ -1,6 +1,5 @@
 fastapi
 uvicorn
-aiomysql
-apscheduler
+httpx
 pydantic
 python-Levenshtein
