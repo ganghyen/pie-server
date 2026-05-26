@@ -28,21 +28,23 @@ async def check_plate(req: CheckPlateRequest):
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 SPRING_API["gate_check"],
-                # ⚠️ 수정 필요: Spring Boot가 받는 JSON 형식에 맞게 수정
                 json={"plate": req.plate},
                 timeout=3,
             )
-            data = response.json()
-
-            # ⚠️ 수정 필요: Spring Boot 응답의 키 이름 확인
-            # 현재: {"is_resident": true/false} 형식 기대
-            is_resident = data.get("is_resident", False)
-
+           
+            # 스프링부트가 정상 응답(200)을 준 경우에만 안전하게 파싱
+            if response.status_code == 200:
+                data = response.json()
+                is_resident = data.get("is_resident", False)
+            else:
+                print(f"[CHECK PLATE] SPRING BOOT ERROR (CODE: {response.status_code})")
+                is_resident = False
+               
     except Exception as e:
         print(f"[CHECK PLATE] Spring Boot 조회 실패: {e}")
         is_resident = False
 
-    print(f"[CHECK PLATE] {req.plate} → is_resident: {is_resident}")
+    print(f"[CHECK PLATE] {req.plate} -> is_resident: {is_resident}")
 
     # 등록 차량이면 10분 후 역추적 실행
     if is_resident:
@@ -53,7 +55,6 @@ async def check_plate(req: CheckPlateRequest):
         "is_resident": is_resident,
         "gate_open":   is_resident
     }
-
 
 # ── 2. 입구 통과 로그 저장 ────────────────────────────────
 @router.post("/entry-log")
