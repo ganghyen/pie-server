@@ -5,7 +5,7 @@
 # ── Spring Boot 서버 주소 ──────────────────────────────────
 # ⚠️ 수정 필요: Spring Boot EC2 주소 받으면 여기만 변경
 # 예시: "http://12.34.56.78:8080"
-SPRING_BOOT_URL = "http://172.20.10.13:8080"
+SPRING_BOOT_URL = "http://localhost:8080"
 
 # ── Spring Boot API 엔드포인트 ────────────────────────────
 # ⚠️ 수정 필요: Spring Boot 팀이 만들어준 API 경로에 맞게 수정
@@ -31,7 +31,7 @@ SPRING_API = {
     # ⚠️ Spring Boot 팀에게 요청: 등록 차량 전체 목록 API
     # car + registered_cars 테이블에서 c_number 전체 반환
     # 반환 형식: [{"c_number": "12가1234"}, ...]
-    "cars":         f"{SPRING_BOOT_URL}/api/parking/cars",
+    "cars":         f"{SPRING_BOOT_URL}/api/cars",
 
     # 입구 차단기
     # ⚠️ Spring Boot 팀에게 요청: 등록 차량 확인 API

@@ -11,7 +11,6 @@ import Levenshtein
 import httpx
 from config import SPRING_API, PLATE_MATCH_THRESHOLD
 
-
 router = APIRouter()
 
 
@@ -22,7 +21,7 @@ async def match_plate(ocr_plate: str) -> str:
 
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.get(SPRING_API["cars"], timeout=3)
+            response = await client.get(SPRING_API["cars"], timeout=8)  # ← 8초
             try:
                 data = response.json()
             except Exception:
@@ -38,12 +37,10 @@ async def match_plate(ocr_plate: str) -> str:
     if not registered:
         return ocr_plate
 
-    # 완전 일치
     if ocr_plate in registered:
         print(f"[PlateMatch] 완전 일치: {ocr_plate}")
         return ocr_plate
 
-    # 유사도 비교
     best_distance = float("inf")
     for reg in registered:
         distance = Levenshtein.distance(ocr_plate, reg)
@@ -52,7 +49,6 @@ async def match_plate(ocr_plate: str) -> str:
 
     same_distance = [r for r in registered if Levenshtein.distance(ocr_plate, r) == best_distance]
 
-    # 후보 2개 이상 → NULL 처리
     if len(same_distance) >= 2:
         print(f"[PlateMatch] 후보 다수: {same_distance} → NULL 처리")
         return None
@@ -69,15 +65,11 @@ async def match_plate(ocr_plate: str) -> str:
 
 # ── 구역 상태 조회 ────────────────────────────────────────
 async def get_zone_status(zone: str) -> str:
-    """
-    Spring Boot에서 구역 현재 상태 조회
-    반환: 'empty' / 'occupied' / 'disabled' / 'unknown'
-    """
     try:
         async with httpx.AsyncClient() as client:
             res = await client.get(
                 f"{SPRING_API['zone_status']}/{zone}",
-                timeout=3
+                timeout=8  # ← 8초
             )
             try:
                 zone_data = res.json()
@@ -115,6 +107,9 @@ async def receive_event(event: ParkingEvent):
 
 # ── 입차 ──────────────────────────────────────────────────
 async def handle_entry(event: ParkingEvent):
+    # gate 모듈 import (순환 import 방지)
+    from routers.gate import start_plate_assignment
+
     entry_time    = event.entry_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     matched_plate = await match_plate(event.plate) if event.plate else None
 
@@ -127,7 +122,7 @@ async def handle_entry(event: ParkingEvent):
                 print(f"[ENTRY] {event.zone} 이미 주차중 → 오류 처리")
                 return {"result": "error", "message": f"{event.zone} 이미 주차중"}
 
-            # 2. ★ 2칸 주차 시 linked_zone도 상태 확인
+            # 2. 2칸 주차 시 linked_zone도 상태 확인
             if event.linked_zone:
                 linked_status = await get_zone_status(event.linked_zone)
                 if linked_status == "occupied":
@@ -147,10 +142,9 @@ async def handle_entry(event: ParkingEvent):
                     "linked_zone": event.linked_zone,
                     "entry_time":  entry_time,
                 },
-                timeout=3,
+                timeout=8,  # ← 8초
             )
 
-            # ★ 500 에러 방지: 응답 상태 코드 확인
             if res.status_code == 409:
                 print(f"[ENTRY] {event.zone} Spring Boot CONFLICT → 이미 주차중")
                 return {"result": "error", "message": f"{event.zone} 이미 주차중"}
@@ -160,17 +154,18 @@ async def handle_entry(event: ParkingEvent):
                 return {"result": "error", "message": f"Spring Boot 에러: {res.status_code}"}
 
         print(f"[ENTRY] {event.zone} | OCR:{event.plate} → 저장:{matched_plate}")
+
+        # ★ 번호판 NULL이면 즉시 역추적 시작
+        if matched_plate is None:
+            print(f"[ENTRY] {event.zone} 번호판 NULL → 역추적 시작")
+            start_plate_assignment(event.zone)
+
         return {"result": "ok", "event": "entry", "zone": event.zone,
                 "ocr_plate": event.plate, "saved_plate": matched_plate}
 
     except Exception as e:
         print(f"[ENTRY] Spring Boot 전달 실패: {e}")
-    except Exception as e:
-        print(f"[ENTRY]Spring Boot fail: {e}")
-        return JSONResponse(status_code+500,
-            content={"result": 
-            "error", "message": f"In Pie entry communication fail: {str(e)}"}
-           ) 
+        return {"result": "fail", "message": str(e)}
 
 
 # ── 출차 ──────────────────────────────────────────────────
@@ -185,10 +180,9 @@ async def handle_exit(event: ParkingEvent):
                     "zone":      event.zone,
                     "exit_time": exit_time,
                 },
-                timeout=3,
+                timeout=8,  # ← 8초
             )
 
-            # ★ 500 에러 방지
             if res.status_code >= 400:
                 print(f"[EXIT] Spring Boot 에러: {res.status_code}")
                 return {"result": "error", "message": f"Spring Boot 에러: {res.status_code}"}
@@ -198,13 +192,7 @@ async def handle_exit(event: ParkingEvent):
 
     except Exception as e:
         print(f"[EXIT] Spring Boot 전달 실패: {e}")
-    except Exception as e:
-        print(f"[EXIT] Spring Boot fail: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"result":
-                "error", "message": f"In Pie Exit Communication Fail: {str(e)}"}
-                )
+        return {"result": "fail", "message": str(e)}
 
 
 # ── 번호판 업데이트 ───────────────────────────────────────
@@ -219,10 +207,9 @@ async def handle_update(event: ParkingEvent):
                     "zone":  event.zone,
                     "plate": matched_plate,
                 },
-                timeout=3,
+                timeout=8,  # ← 8초
             )
 
-            # ★ 500 에러 방지
             if res.status_code >= 400:
                 print(f"[UPDATE] Spring Boot 에러: {res.status_code}")
                 return {"result": "error", "message": f"Spring Boot 에러: {res.status_code}"}
@@ -233,10 +220,4 @@ async def handle_update(event: ParkingEvent):
 
     except Exception as e:
         print(f"[UPDATE] Spring Boot 전달 실패: {e}")
-    except Exception as e:
-        print(f"[UPDATE] Spring Boot fail: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"result":
-                "error", "message": f" In Pie Number Update Communication fail: {str(e)}"}
-                )
+        return {"result": "fail", "message": str(e)}
