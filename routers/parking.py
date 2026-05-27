@@ -3,12 +3,14 @@
 # ============================================================
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
 import Levenshtein
 import httpx
 from config import SPRING_API, PLATE_MATCH_THRESHOLD
+
 
 router = APIRouter()
 
@@ -21,11 +23,12 @@ async def match_plate(ocr_plate: str) -> str:
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(SPRING_API["cars"], timeout=3)
-            data = response.json()
+            try:
+                data = response.json()
+            except Exception:
+                print(f"[PlateMatch] 응답 파싱 실패 → 원본 사용")
+                return ocr_plate
 
-            # ⚠️ 수정 필요: Spring Boot가 반환하는 형식에 맞게 수정
-            # 현재: [{"c_number": "12가1234"}, ...]
-            # Spring Boot 응답 형식이 다르면 아래 줄 수정
             registered = [car["c_number"] for car in data]
 
     except Exception as e:
@@ -64,6 +67,29 @@ async def match_plate(ocr_plate: str) -> str:
         return ocr_plate
 
 
+# ── 구역 상태 조회 ────────────────────────────────────────
+async def get_zone_status(zone: str) -> str:
+    """
+    Spring Boot에서 구역 현재 상태 조회
+    반환: 'empty' / 'occupied' / 'disabled' / 'unknown'
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.get(
+                f"{SPRING_API['zone_status']}/{zone}",
+                timeout=3
+            )
+            try:
+                zone_data = res.json()
+                return zone_data.get("status_type", "unknown")
+            except Exception:
+                print(f"[ZoneStatus] 응답 파싱 실패")
+                return "unknown"
+    except Exception as e:
+        print(f"[ZoneStatus] 조회 실패: {e}")
+        return "unknown"
+
+
 # ── 요청 모델 ─────────────────────────────────────────────
 class ParkingEvent(BaseModel):
     event:       str
@@ -95,34 +121,43 @@ async def handle_entry(event: ParkingEvent):
     try:
         async with httpx.AsyncClient() as client:
 
-            # 1. 구역 현재 상태 확인
-            # ⚠️ 수정 필요: Spring Boot 응답 형식에 맞게 수정
-            # 현재: {"status_type": "occupied"} 형식 기대
-            res = await client.get(
-                f"{SPRING_API['zone_status']}/{event.zone}",
-                timeout=3
-            )
-            zone_data = res.json()
-
-            # ⚠️ 수정 필요: Spring Boot 응답의 상태값 키 확인
-            # 현재: zone_data.get("status_type") 로 확인
-            if zone_data.get("status_type") == "occupied":
+            # 1. 메인 구역 상태 확인
+            status = await get_zone_status(event.zone)
+            if status == "occupied":
                 print(f"[ENTRY] {event.zone} 이미 주차중 → 오류 처리")
                 return {"result": "error", "message": f"{event.zone} 이미 주차중"}
 
-            # 2. 입차 저장 요청
-            # ⚠️ 수정 필요: Spring Boot가 받는 JSON 형식에 맞게 수정
-            await client.post(
+            # 2. ★ 2칸 주차 시 linked_zone도 상태 확인
+            if event.linked_zone:
+                linked_status = await get_zone_status(event.linked_zone)
+                if linked_status == "occupied":
+                    print(f"[ENTRY] {event.linked_zone} 이미 주차중 → 2칸주차 오류 처리")
+                    return {
+                        "result": "error",
+                        "message": f"{event.linked_zone} 이미 주차중 (2칸주차 불가)"
+                    }
+
+            # 3. 입차 저장 요청
+            res = await client.post(
                 SPRING_API["entry"],
                 json={
-                    "zone":        event.zone,       # 주차구역
-                    "plate":       matched_plate,     # 차량번호 (NULL 가능)
-                    "park_type":   event.park_type,  # 주차유형
-                    "linked_zone": event.linked_zone, # 2칸주차 연결구역
-                    "entry_time":  entry_time,        # 입차시간
+                    "zone":        event.zone,
+                    "plate":       matched_plate,
+                    "park_type":   event.park_type,
+                    "linked_zone": event.linked_zone,
+                    "entry_time":  entry_time,
                 },
                 timeout=3,
             )
+
+            # ★ 500 에러 방지: 응답 상태 코드 확인
+            if res.status_code == 409:
+                print(f"[ENTRY] {event.zone} Spring Boot CONFLICT → 이미 주차중")
+                return {"result": "error", "message": f"{event.zone} 이미 주차중"}
+
+            if res.status_code >= 400:
+                print(f"[ENTRY] Spring Boot 에러: {res.status_code}")
+                return {"result": "error", "message": f"Spring Boot 에러: {res.status_code}"}
 
         print(f"[ENTRY] {event.zone} | OCR:{event.plate} → 저장:{matched_plate}")
         return {"result": "ok", "event": "entry", "zone": event.zone,
@@ -130,7 +165,12 @@ async def handle_entry(event: ParkingEvent):
 
     except Exception as e:
         print(f"[ENTRY] Spring Boot 전달 실패: {e}")
-        raise HTTPException(status_code=500, detail="Spring Boot 전달 실패")
+    except Exception as e:
+        print(f"[ENTRY]Spring Boot fail: {e}")
+        return JSONResponse(status_code+500,
+            content={"result": 
+            "error", "message": f"In Pie entry communication fail: {str(e)}"}
+           ) 
 
 
 # ── 출차 ──────────────────────────────────────────────────
@@ -139,22 +179,32 @@ async def handle_exit(event: ParkingEvent):
 
     try:
         async with httpx.AsyncClient() as client:
-            # ⚠️ 수정 필요: Spring Boot가 받는 JSON 형식에 맞게 수정
-            await client.post(
+            res = await client.post(
                 SPRING_API["exit"],
                 json={
-                    "zone":      event.zone,     # 주차구역
-                    "exit_time": exit_time,       # 출차시간
+                    "zone":      event.zone,
+                    "exit_time": exit_time,
                 },
                 timeout=3,
             )
+
+            # ★ 500 에러 방지
+            if res.status_code >= 400:
+                print(f"[EXIT] Spring Boot 에러: {res.status_code}")
+                return {"result": "error", "message": f"Spring Boot 에러: {res.status_code}"}
 
         print(f"[EXIT] {event.zone}")
         return {"result": "ok", "event": "exit", "zone": event.zone}
 
     except Exception as e:
         print(f"[EXIT] Spring Boot 전달 실패: {e}")
-        raise HTTPException(status_code=500, detail="Spring Boot 전달 실패")
+    except Exception as e:
+        print(f"[EXIT] Spring Boot fail: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"result":
+                "error", "message": f"In Pie Exit Communication Fail: {str(e)}"}
+                )
 
 
 # ── 번호판 업데이트 ───────────────────────────────────────
@@ -163,15 +213,19 @@ async def handle_update(event: ParkingEvent):
 
     try:
         async with httpx.AsyncClient() as client:
-            # ⚠️ 수정 필요: Spring Boot가 받는 JSON 형식에 맞게 수정
-            await client.post(
+            res = await client.post(
                 SPRING_API["update_plate"],
                 json={
-                    "zone":  event.zone,    # 주차구역
-                    "plate": matched_plate, # 차량번호
+                    "zone":  event.zone,
+                    "plate": matched_plate,
                 },
                 timeout=3,
             )
+
+            # ★ 500 에러 방지
+            if res.status_code >= 400:
+                print(f"[UPDATE] Spring Boot 에러: {res.status_code}")
+                return {"result": "error", "message": f"Spring Boot 에러: {res.status_code}"}
 
         print(f"[UPDATE] {event.zone} | OCR:{event.plate} → 저장:{matched_plate}")
         return {"result": "ok", "event": "update", "zone": event.zone,
@@ -179,4 +233,10 @@ async def handle_update(event: ParkingEvent):
 
     except Exception as e:
         print(f"[UPDATE] Spring Boot 전달 실패: {e}")
-        raise HTTPException(status_code=500, detail="Spring Boot 전달 실패")
+    except Exception as e:
+        print(f"[UPDATE] Spring Boot fail: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"result":
+                "error", "message": f" In Pie Number Update Communication fail: {str(e)}"}
+                )
