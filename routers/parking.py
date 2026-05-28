@@ -1,9 +1,10 @@
 # ============================================================
 # 주차 이벤트 라우터 (파이 → FastAPI → Spring Boot)
 #
-# 추가된 기능:
-#   1. 입차 시 스냅샷 이미지 경로 Spring Boot로 전달
-#   2. OCR null/unreadable 시 관리자 알림 전송
+# 수정사항:
+#   1. image_path, ocr_error 필드 추가
+#   2. Spring Boot 저장 실패 시 HTTPException으로 실패 상태코드 반환
+#      → sender.py가 실패로 판단해서 재전송 큐에 저장되게
 # ============================================================
 
 from fastapi import APIRouter, HTTPException
@@ -17,6 +18,7 @@ from config import SPRING_API, PLATE_MATCH_THRESHOLD
 router = APIRouter()
 
 
+# ── OCR 오인식 보정 ───────────────────────────────────────
 async def match_plate(ocr_plate: str) -> str:
     """
     OCR 인식 결과를 DB 등록 차량 목록과 비교해서 오인식 보정.
@@ -72,6 +74,7 @@ async def match_plate(ocr_plate: str) -> str:
         return ocr_plate
 
 
+# ── 구역 상태 조회 ────────────────────────────────────────
 async def get_zone_status(zone: str) -> str:
     """Spring Boot에서 특정 주차 구역의 현재 상태 조회."""
     try:
@@ -91,6 +94,7 @@ async def get_zone_status(zone: str) -> str:
         return "unknown"
 
 
+# ── 요청 모델 ─────────────────────────────────────────────
 class ParkingEvent(BaseModel):
     event:       str
     zone:        str
@@ -99,8 +103,10 @@ class ParkingEvent(BaseModel):
     linked_zone: Optional[str]  = None
     entry_time:  Optional[str]  = None
     exit_time:   Optional[str]  = None
-    image_path:  Optional[str]  = None   # ✅ 추가: 입차 시점 스냅샷 경로
-    ocr_error:   Optional[bool] = False  # ✅ 추가: OCR 인식 불가 여부
+    # ✅ 추가: 입차 시점 스냅샷 경로
+    image_path:  Optional[str]  = None
+    # ✅ 추가: OCR 인식 불가 여부
+    ocr_error:   Optional[bool] = False
 
 
 @router.post("/event")
@@ -116,6 +122,7 @@ async def receive_event(event: ParkingEvent):
         raise HTTPException(status_code=400, detail="Unknown event type")
 
 
+# ── 입차 ──────────────────────────────────────────────────
 async def handle_entry(event: ParkingEvent):
     """
     입차 이벤트 처리 흐름:
@@ -124,6 +131,7 @@ async def handle_entry(event: ParkingEvent):
     3. Spring Boot 입차 저장 요청 (image_path 포함)
     4. OCR null/unreadable 시 관리자 알림 전송
     5. 번호판 NULL이면 역추적 시작
+    ✅ 수정: Spring Boot 저장 실패 시 HTTPException 반환
     """
     from routers.gate import start_plate_assignment
 
@@ -137,16 +145,20 @@ async def handle_entry(event: ParkingEvent):
             status = await get_zone_status(event.zone)
             if status == "occupied":
                 print(f"[ENTRY] {event.zone} 이미 주차중 → 오류 처리")
-                return {"result": "error", "message": f"{event.zone} 이미 주차중"}
+                # ✅ 수정: HTTPException으로 반환
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{event.zone} 이미 주차중"
+                )
 
             # 2칸 주차 시 연결 구역도 확인
             if event.linked_zone:
                 linked_status = await get_zone_status(event.linked_zone)
                 if linked_status == "occupied":
-                    return {
-                        "result": "error",
-                        "message": f"{event.linked_zone} 이미 주차중 (2칸주차 불가)"
-                    }
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"{event.linked_zone} 이미 주차중 (2칸주차 불가)"
+                    )
 
             # Spring Boot 입차 저장 (image_path 포함)
             res = await client.post(
@@ -157,19 +169,27 @@ async def handle_entry(event: ParkingEvent):
                     "park_type":   event.park_type,
                     "linked_zone": event.linked_zone,
                     "entry_time":  entry_time,
-                    "image_path":  event.image_path,  # ✅ 스냅샷 경로 전달
+                    # ✅ 추가: 스냅샷 경로 전달
+                    "image_path":  event.image_path,
                 },
                 timeout=8,
             )
 
+            # ✅ 수정: Spring Boot 저장 실패 시 HTTPException 반환
+            # sender.py가 HTTP 200이 아니면 실패로 판단해서 재전송 큐에 저장
             if res.status_code == 409:
-                return {"result": "error", "message": f"{event.zone} 이미 주차중"}
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{event.zone} 이미 주차중"
+                )
 
             if res.status_code >= 400:
-                return {"result": "error", "message": f"Spring Boot 에러: {res.status_code}"}
+                raise HTTPException(
+                    status_code=res.status_code,
+                    detail=f"Spring Boot 에러: {res.text}"
+                )
 
             # ✅ OCR null/unreadable 시 관리자 알림 전송
-            # ocr_error=True 이고 image_path가 있을 때만 전송
             if event.ocr_error and event.image_path:
                 try:
                     await client.post(
@@ -199,13 +219,24 @@ async def handle_entry(event: ParkingEvent):
             "saved_plate": matched_plate
         }
 
+    except HTTPException:
+        # HTTPException은 그대로 위로 올림
+        raise
     except Exception as e:
         print(f"[ENTRY] Spring Boot 전달 실패: {e}")
-        return {"result": "fail", "message": str(e)}
+        # ✅ 수정: 예외 발생 시 500 반환 → sender.py가 재전송 큐에 저장
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
 
 
+# ── 출차 ──────────────────────────────────────────────────
 async def handle_exit(event: ParkingEvent):
-    """출차 이벤트: 출차 시각과 함께 Spring Boot로 출차 저장 요청."""
+    """
+    출차 이벤트 처리.
+    ✅ 수정: Spring Boot 저장 실패 시 HTTPException 반환
+    """
     exit_time = event.exit_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     try:
@@ -219,19 +250,32 @@ async def handle_exit(event: ParkingEvent):
                 timeout=8,
             )
 
+            # ✅ 수정: Spring Boot 저장 실패 시 HTTPException 반환
             if res.status_code >= 400:
-                return {"result": "error", "message": f"Spring Boot 에러: {res.status_code}"}
+                raise HTTPException(
+                    status_code=res.status_code,
+                    detail=f"Spring Boot 에러: {res.text}"
+                )
 
         print(f"[EXIT] {event.zone}")
         return {"result": "ok", "event": "exit", "zone": event.zone}
 
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"[EXIT] Spring Boot 전달 실패: {e}")
-        return {"result": "fail", "message": str(e)}
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
 
 
+# ── 번호판 업데이트 ───────────────────────────────────────
 async def handle_update(event: ParkingEvent):
-    """번호판 업데이트: OCR 보정 후 Spring Boot로 번호판 갱신 요청."""
+    """
+    번호판 업데이트 처리.
+    ✅ 수정: Spring Boot 저장 실패 시 HTTPException 반환
+    """
     matched_plate = await match_plate(event.plate) if event.plate else None
 
     try:
@@ -245,8 +289,12 @@ async def handle_update(event: ParkingEvent):
                 timeout=8,
             )
 
+            # ✅ 수정: Spring Boot 저장 실패 시 HTTPException 반환
             if res.status_code >= 400:
-                return {"result": "error", "message": f"Spring Boot 에러: {res.status_code}"}
+                raise HTTPException(
+                    status_code=res.status_code,
+                    detail=f"Spring Boot 에러: {res.text}"
+                )
 
         print(f"[UPDATE] {event.zone} | OCR:{event.plate} → 저장:{matched_plate}")
         return {
@@ -257,6 +305,11 @@ async def handle_update(event: ParkingEvent):
             "saved_plate": matched_plate
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"[UPDATE] Spring Boot 전달 실패: {e}")
-        return {"result": "fail", "message": str(e)}
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
