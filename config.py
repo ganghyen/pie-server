@@ -5,7 +5,7 @@
 # ── Spring Boot 서버 주소 ──────────────────────────────────
 # ⚠️ 수정 필요: Spring Boot EC2 주소 받으면 여기만 변경
 # 예시: "http://12.34.56.78:8080"
-SPRING_BOOT_URL = "http://localhost:8080"
+SPRING_BOOT_URL = "http://10.69.39.174:8080"
 
 # ── Spring Boot API 엔드포인트 ────────────────────────────
 # ⚠️ 수정 필요: Spring Boot 팀이 만들어준 API 경로에 맞게 수정
