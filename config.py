@@ -2,40 +2,66 @@
 # 서버 설정
 # ============================================================
 
-# Spring Boot 서버 주소 (포트 8080)
+# ── Spring Boot 서버 주소 ──────────────────────────────────
+# ⚠️ 수정 필요: Spring Boot EC2 주소 받으면 여기만 변경
+# 예시: "http://12.34.56.78:8080"
 SPRING_BOOT_URL = "http://localhost:8080"
 
-# Spring Boot API 엔드포인트 전체 목록
+# ── Spring Boot API 엔드포인트 ────────────────────────────
 SPRING_API = {
-    # 특정 주차칸 현재 상태 조회 (occupied/empty)
+    # 주차 이벤트
+    # ⚠️ Spring Boot 팀에게 요청: 구역 현재 상태 조회 API
     "zone_status":  f"{SPRING_BOOT_URL}/api/parking/zone",
-    # 입차 이벤트 저장 (parking_zone occupied + parking_history INSERT)
+
+    # ⚠️ Spring Boot 팀에게 요청: 입차 저장 API
+    # parking_status UPDATE (occupied) + parking_history INSERT
+    # car 테이블에서 c_number로 u_no 조회해서 저장
     "entry":        f"{SPRING_BOOT_URL}/api/parking/entry",
-    # 출차 이벤트 저장 (parking_zone empty + parking_history exit_time 갱신)
+
+    # ⚠️ Spring Boot 팀에게 요청: 출차 저장 API
+    # parking_status UPDATE (empty) + parking_history exit_time UPDATE
     "exit":         f"{SPRING_BOOT_URL}/api/parking/exit",
-    # 번호판 업데이트 (parking_history history_plate 갱신)
+
+    # ⚠️ Spring Boot 팀에게 요청: 번호판 업데이트 API
+    # parking_history history_plate UPDATE
     "update_plate": f"{SPRING_BOOT_URL}/api/parking/update-plate",
-    # 등록 차량 전체 번호판 목록 조회 (OCR 보정용)
+
+    # 차량 조회
+    # car + registered_cars 테이블에서 c_number 전체 반환
     # 반환 형식: [{"c_number": "12가1234"}, ...]
-    "cars":         f"{SPRING_BOOT_URL}/api/cars",
-    # 입구 차단기: 번호판이 등록 차량인지 확인
+    "cars":         f"{SPRING_BOOT_URL}/api/parking/cars",
+
+    # 입구 차단기
+    # ⚠️ Spring Boot 팀에게 요청: 등록 차량 확인 API
+    # car + registered_cars 에서 번호판 조회
     # 반환 형식: {"is_resident": true/false}
     "gate_check":   f"{SPRING_BOOT_URL}/api/gate/check",
-    # 입구 통과 로그 저장 (gate_entry_log INSERT)
+
+    # ⚠️ Spring Boot 팀에게 요청: 입구 통과 로그 저장 API
+    # gate_entry_log INSERT
     "gate_log":     f"{SPRING_BOOT_URL}/api/gate/log",
-    # 번호판 NULL인 진행 중 주차 기록 조회 (역추적용)
+
+    # 이중주차 역추적
+    # ⚠️ Spring Boot 팀에게 요청: 번호판 없는 주차 기록 조회 API
+    # parking_history WHERE history_plate IS NULL AND history_exit_time IS NULL
     # 반환 형식: [{"history_id": 1, "history_zone": "A-1"}, ...]
     "unmatched":    f"{SPRING_BOOT_URL}/api/gate/unmatched",
-    # 차단기 인식 번호판을 UNKNOWN 주차 기록에 연결
+
+    # 번호판 자동 부여 API
+    # /api/gate/unmatched에서 history_id를 먼저 찾은 뒤 plate와 함께 전달한다.
     "assign_plate": f"{SPRING_BOOT_URL}/api/gate/assign-plate",
-    # 이중주차 알림 저장 + FCM 발송 요청
+
+    # ⚠️ Spring Boot 팀에게 요청: 이중주차 알림 저장 API
+    # double_park_alert INSERT + 차주/관리자 FCM 알림 발송
     "alert":        f"{SPRING_BOOT_URL}/api/gate/alert",
 }
 
-# Levenshtein 거리 기반 번호판 보정 임계값
-# 1: 글자 1개 차이까지 보정 / 2: 글자 2개 차이까지 보정
+# ── 번호판 유사도 매칭 임계값 ──────────────────────────────
+# 1: 글자 1개 차이까지 보정
+# 2: 글자 2개 차이까지 보정
+# ⚠️ 수정 가능: 인식률에 따라 조절
 PLATE_MATCH_THRESHOLD = 2
 
-# 입구 통과 후 주차 확인 대기 시간 (분)
-# 이 시간 내에 주차 구역에서 번호판 매칭 시도
+# ── 입구 통과 후 주차 확인 시간 (분) ──────────────────────
+# ⚠️ 수정 가능: 테스트 시 1~2분으로 줄여서 테스트
 GATE_CHECK_MINUTES = 10
