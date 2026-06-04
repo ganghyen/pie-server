@@ -4,7 +4,7 @@
 
 # Spring Boot 서버 주소
 # ⚠️ 시연 전 실제 실행 환경 IP로 확인 필요
-SPRING_BOOT_URL = "http://172.16.104.196:8080"
+SPRING_BOOT_URL = "http://172.16.106.195:8080"
 
 # Spring Boot API 엔드포인트 전체 목록
 SPRING_API = {
