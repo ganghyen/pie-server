@@ -13,7 +13,7 @@ from typing import Optional
 from datetime import datetime
 import Levenshtein
 import httpx
-from config import SPRING_API, PLATE_MATCH_THRESHOLD
+from config import SPRING_API, PLATE_MATCH_THRESHOLD, APARTMENT_NO
 
 router = APIRouter()
 
@@ -103,10 +103,19 @@ class ParkingEvent(BaseModel):
     linked_zone: Optional[str]  = None
     entry_time:  Optional[str]  = None
     exit_time:   Optional[str]  = None
+    # Python 장비가 속한 아파트 번호. 없으면 config.APARTMENT_NO 사용
+    apartment_no: Optional[int] = None
+    apartmentNo: Optional[int] = None
+    a_no: Optional[int] = None
     # ✅ 추가: 입차 시점 스냅샷 경로
     image_path:  Optional[str]  = None
     # ✅ 추가: OCR 인식 불가 여부
     ocr_error:   Optional[bool] = False
+
+
+def resolve_apartment_no(event: ParkingEvent) -> int:
+    """이벤트에 아파트 번호가 없으면 config.APARTMENT_NO를 기본값으로 사용."""
+    return event.apartment_no or event.apartmentNo or event.a_no or APARTMENT_NO
 
 
 @router.post("/event")
@@ -137,6 +146,7 @@ async def handle_entry(event: ParkingEvent):
 
     entry_time    = event.entry_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     matched_plate = await match_plate(event.plate) if event.plate else None
+    apartment_no  = resolve_apartment_no(event)
 
     try:
         async with httpx.AsyncClient() as client:
@@ -189,17 +199,34 @@ async def handle_entry(event: ParkingEvent):
                     detail=f"Spring Boot 에러: {res.text}"
                 )
 
+            entry_result = {}
+            try:
+                entry_result = res.json()
+            except Exception:
+                entry_result = {}
+            history_id = (
+                entry_result.get("history_id")
+                or entry_result.get("historyId")
+            )
+
             # ✅ OCR null/unreadable 시 관리자 알림 전송
             if event.ocr_error and event.image_path:
                 try:
+                    alert_payload = {
+                        "zone":         event.zone,
+                        "type":         "ocr_error",
+                        "plate":        matched_plate or event.plate,
+                        "candidates":   "OCR 인식 불가",
+                        "time":         entry_time,
+                        "image_path":   event.image_path,
+                        "apartment_no": apartment_no,
+                    }
+                    if history_id is not None:
+                        alert_payload["history_id"] = history_id
+
                     await client.post(
                         SPRING_API["alert"],
-                        json={
-                            "zone":       event.zone,
-                            "type":       "ocr_error",
-                            "candidates": f"OCR 인식 불가 | 이미지: {event.image_path}",
-                            "time":       entry_time,
-                        },
+                        json=alert_payload,
                         timeout=8,
                     )
                     print(f"[OCR ERROR] {event.zone} 오류 알림 전송 | {event.image_path}")

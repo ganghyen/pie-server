@@ -16,7 +16,7 @@ from typing import Optional
 from datetime import datetime
 import httpx
 import asyncio
-from config import SPRING_API, GATE_CHECK_MINUTES
+from config import SPRING_API, GATE_CHECK_MINUTES, APARTMENT_NO
 
 router = APIRouter()
 
@@ -27,6 +27,11 @@ pending_lock = asyncio.Lock()
 
 class CheckPlateRequest(BaseModel):
     plate: str
+    # Spring Boot는 apartment_no/apartmentNo/a_no 모두 받을 수 있게 해둠
+    # Python 장비가 어느 아파트 입구인지 명확히 전달하기 위한 값
+    apartment_no: Optional[int] = None
+    apartmentNo: Optional[int] = None
+    a_no: Optional[int] = None
 
 
 class EntryLogRequest(BaseModel):
@@ -34,6 +39,15 @@ class EntryLogRequest(BaseModel):
     is_resident: bool
     # 실제 차단기 개방 여부 (없으면 is_resident 기준으로 처리)
     gate_open:   Optional[bool] = None
+
+
+def resolve_apartment_no(
+    apartment_no: Optional[int] = None,
+    apartmentNo: Optional[int] = None,
+    a_no: Optional[int] = None,
+) -> int:
+    """요청에 아파트 번호가 없으면 config.APARTMENT_NO를 기본값으로 사용."""
+    return apartment_no or apartmentNo or a_no or APARTMENT_NO
 
 
 # ── 1. 등록 차량 확인 + 차단기 제어 ──────────────────────
@@ -50,11 +64,18 @@ async def check_plate(req: CheckPlateRequest):
 
     위 판단은 모두 Spring Boot에서 처리.
     """
+    apartment_no = resolve_apartment_no(
+        req.apartment_no, req.apartmentNo, req.a_no
+    )
+
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 SPRING_API["gate_check"],
-                json={"plate": req.plate},
+                json={
+                    "plate":        req.plate,
+                    "apartment_no": apartment_no,
+                },
                 timeout=8,
             )
 
@@ -66,6 +87,7 @@ async def check_plate(req: CheckPlateRequest):
             )
             return {
                 "plate":        req.plate,
+                "apartment_no": apartment_no,
                 "is_resident":  False,
                 "is_registered": False,
                 "gate_open":    False,
@@ -78,6 +100,7 @@ async def check_plate(req: CheckPlateRequest):
         print(f"[CHECK PLATE] Spring Boot 조회 실패: {e}")
         return {
             "plate":        req.plate,
+            "apartment_no": apartment_no,
             "is_resident":  False,
             "is_registered": False,
             "gate_open":    False,
@@ -112,6 +135,7 @@ async def check_plate(req: CheckPlateRequest):
     # Spring Boot 응답 전체를 그대로 전달
     return {
         "plate":                   data.get("plate", req.plate),
+        "apartment_no":            data.get("apartment_no", apartment_no),
         "is_resident":             bool(data.get("is_resident", is_registered)),
         "is_registered":           is_registered,
         "is_resident_vehicle":     bool(data.get("is_resident_vehicle", False)),
@@ -163,9 +187,69 @@ async def entry_log(req: EntryLogRequest):
         return {"result": "fail"}
 
 
-# ── 3. 아두이노 차단기 상태 확인 ──────────────────────────
+# ── 3. 관리자 상시개방 상태 조회 ──────────────────────────
+@router.get("/gate/control")
+async def gate_control(
+    apartment_no: Optional[int] = None,
+    apartmentNo: Optional[int] = None,
+    a_no: Optional[int] = None,
+):
+    """
+    장비가 주기적으로 호출해서 관리자 상시개방 설정을 확인.
+    Spring Boot /api/gate/control 값을 그대로 전달한다.
+    """
+    resolved_apartment_no = resolve_apartment_no(
+        apartment_no, apartmentNo, a_no
+    )
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                SPRING_API["gate_control_base"],
+                params={"apartmentNo": resolved_apartment_no},
+                timeout=8,
+            )
+
+        if response.status_code >= 400:
+            print(
+                f"[GATE CONTROL] Spring Boot 에러 "
+                f"({response.status_code}) | {response.text}"
+            )
+            return {
+                "apartment_no": resolved_apartment_no,
+                "gate_open": False,
+                "mode": "ERROR",
+                "reason": "Spring Boot 상시개방 상태 조회 실패",
+            }
+
+        data = response.json()
+        return {
+            "apartment_no": data.get("apartment_no", resolved_apartment_no),
+            "gate_open": bool(data.get("gate_open", False)),
+            "mode": data.get("mode", "NORMAL"),
+            "gate_force_open_enabled": data.get("gate_force_open_enabled"),
+            "force_open_enabled": data.get("force_open_enabled"),
+            "reason": data.get("reason"),
+        }
+
+    except Exception as e:
+        print(f"[GATE CONTROL] Spring Boot 조회 실패: {e}")
+        return {
+            "apartment_no": resolved_apartment_no,
+            "gate_open": False,
+            "mode": "ERROR",
+            "reason": "Spring Boot 연결 실패",
+        }
+
+
+# ── 4. 아두이노 차단기 상태 확인 ──────────────────────────
 @router.get("/gate/status")
-async def gate_status(plate: str):
+async def gate_status(
+    plate: str,
+    apartment_no: Optional[int] = None,
+    apartmentNo: Optional[int] = None,
+    a_no: Optional[int] = None,
+):
     """
     아두이노 차단기가 특정 번호판의 개방 여부를 확인.
     is_resident가 아닌 Spring Boot 응답의 gate_open 사용.
@@ -176,11 +260,18 @@ async def gate_status(plate: str):
     - 관리자가 방문차량 혼잡도 차단을 켠 경우
       등록된 방문차량이어도 gate_open=false가 될 수 있음
     """
+    resolved_apartment_no = resolve_apartment_no(
+        apartment_no, apartmentNo, a_no
+    )
+
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 SPRING_API["gate_check"],
-                json={"plate": plate},
+                json={
+                    "plate":        plate,
+                    "apartment_no": resolved_apartment_no,
+                },
                 timeout=8,
             )
             data      = response.json()
@@ -193,6 +284,7 @@ async def gate_status(plate: str):
     print(f"[GATE STATUS] {plate} → gate_open: {gate_open}")
     return {
         "plate":                   data.get("plate", plate),
+        "apartment_no":            data.get("apartment_no", resolved_apartment_no),
         "gate_open":               gate_open,
         "reason":                  data.get("reason"),
         "force_open_enabled":      data.get("force_open_enabled"),
@@ -200,7 +292,7 @@ async def gate_status(plate: str):
     }
 
 
-# ── 4. UNKNOWN 주차 기록에서 구역 매칭 ───────────────────
+# ── 5. UNKNOWN 주차 기록에서 구역 매칭 ───────────────────
 async def find_unmatched_history_id(zone: str) -> int | None:
     """
     Spring Boot에서 번호판이 UNKNOWN인 진행 중 주차 기록을 조회하고
@@ -253,7 +345,7 @@ async def find_unmatched_history_id(zone: str) -> int | None:
         return None
 
 
-# ── 5. 번호판 NULL 입차 → 역추적 ─────────────────────────
+# ── 6. 번호판 NULL 입차 → 역추적 ─────────────────────────
 async def try_assign_plate_to_null_parking(zone: str):
     """
     번호판 NULL로 입차된 구역에 pending_plates에서 번호판 역추적 매칭.
@@ -365,7 +457,7 @@ async def try_assign_plate_to_null_parking(zone: str):
             print(f"[ASSIGN] 알림 저장 실패: {e}")
 
 
-# ── 6. 외부 호출: 번호판 NULL 입차 시 역추적 시작 ─────────
+# ── 7. 외부 호출: 번호판 NULL 입차 시 역추적 시작 ─────────
 def start_plate_assignment(zone: str):
     """parking.py에서 번호판 NULL 입차 발생 시 호출."""
     asyncio.create_task(try_assign_plate_to_null_parking(zone))

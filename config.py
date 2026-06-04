@@ -4,7 +4,11 @@
 
 # Spring Boot 서버 주소
 # ⚠️ 시연 전 실제 실행 환경 IP로 확인 필요
-SPRING_BOOT_URL = "http://172.16.106.195:8080"
+SPRING_BOOT_URL = "http://172.16.104.196:8080"
+
+# 현재 Python 장비가 연결된 아파트 번호
+# 여러 아파트를 운영하면 장비별로 이 값을 바꿔서 사용
+APARTMENT_NO = 1
 
 # Spring Boot API 엔드포인트 전체 목록
 SPRING_API = {
@@ -42,7 +46,8 @@ SPRING_API = {
 
     # 차단기 상시개방 상태 조회 (관리자 설정용)
     # 반환 형식: {"gate_open": true/false, "mode": "FORCE_OPEN", ...}
-    "gate_control":  f"{SPRING_BOOT_URL}/api/gate/control?apartmentNo=1",
+    "gate_control_base": f"{SPRING_BOOT_URL}/api/gate/control",
+    "gate_control":  f"{SPRING_BOOT_URL}/api/gate/control?apartmentNo={APARTMENT_NO}",
 }
 
 # Levenshtein 거리 기반 번호판 보정 임계값
