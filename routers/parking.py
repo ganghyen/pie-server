@@ -1,15 +1,11 @@
 # ============================================================
-# 주차 이벤트 라우터 (파이 → FastAPI → Spring Boot)
+# 주차 이벤트 라우터 (파이 → FastAPI → Spring Boot) 2
 #
 # 수정사항:
-#   1. image_path, ocr_error 필드 추가
+#   1. image_path → image_base64 로 변경
+#      2칸주차/통로주차일 때만 base64 이미지 전달
 #   2. Spring Boot 저장 실패 시 HTTPException으로 실패 상태코드 반환
-#      → sender.py가 실패로 판단해서 재전송 큐에 저장되게
-#   3. ✅ 출차 후 DB 확인/재전송 FastAPI가 전담
-#      - exit 받으면 Spring Boot에 저장 후 백그라운드 감시 시작
-#      - 30초마다 Spring Boot DB 조회
-#      - DB OCCUPIED → exit 재전송
-#      - DB EMPTY → 감시 종료
+#   3. 출차 후 DB 확인/재전송 FastAPI가 전담
 # ============================================================
 
 from fastapi import APIRouter, HTTPException
@@ -23,9 +19,8 @@ from config import SPRING_API, PLATE_MATCH_THRESHOLD, APARTMENT_NO
 
 router = APIRouter()
 
-# ✅ 출차 후 DB 확인 설정
-EXIT_VERIFY_INTERVAL = 30.0  # DB 확인 주기 (초)
-EXIT_VERIFY_MAX      = 10    # 최대 재시도 횟수 (10회 × 30초 = 5분)
+EXIT_VERIFY_INTERVAL = 30.0
+EXIT_VERIFY_MAX      = 10
 
 
 # ── OCR 오인식 보정 ───────────────────────────────────────
@@ -42,14 +37,12 @@ async def match_plate(ocr_plate: str) -> str:
                 print(f"[PlateMatch] 응답 파싱 실패 → 원본 사용")
                 return ocr_plate
             registered = [car["c_number"] for car in data]
-
     except Exception as e:
         print(f"[PlateMatch] 차량 목록 조회 실패: {e} → 원본 사용")
         return ocr_plate
 
     if not registered:
         return ocr_plate
-
     if ocr_plate in registered:
         print(f"[PlateMatch] 완전 일치: {ocr_plate}")
         return ocr_plate
@@ -70,7 +63,6 @@ async def match_plate(ocr_plate: str) -> str:
         return None
 
     best_plate = same_distance[0]
-
     if best_distance <= PLATE_MATCH_THRESHOLD:
         print(f"[PlateMatch] 오인식 보정: {ocr_plate} → {best_plate}")
         return best_plate
@@ -91,54 +83,32 @@ async def get_zone_status(zone: str) -> str:
                 zone_data = res.json()
                 return zone_data.get("status_type", "unknown")
             except Exception:
-                print(f"[ZoneStatus] 응답 파싱 실패")
                 return "unknown"
     except Exception as e:
         print(f"[ZoneStatus] 조회 실패: {e}")
         return "unknown"
 
 
-# ✅ 출차 후 DB 확인 백그라운드 태스크
+# ── 출차 후 DB 확인 백그라운드 태스크 ────────────────────
 async def exit_verify_task(zone_name: str, exit_time: str):
-    """
-    출차 저장 후 DB가 EMPTY로 반영됐는지 주기적으로 확인.
-    FastAPI가 전담 - 카메라는 exit 한 번만 보내면 끝.
-
-    흐름:
-      1. Spring Boot에 DB 상태 조회
-      2. DB EMPTY  → 정상, 감시 종료
-      3. DB OCCUPIED → Spring Boot에 exit 직접 재전송
-      4. EXIT_VERIFY_MAX 초과 → 로그만 남기고 종료
-    """
-    print(f"[ExitVerify] {zone_name} 감시 시작 "
-          f"(최대 {EXIT_VERIFY_MAX}회 × {EXIT_VERIFY_INTERVAL}초)")
+    print(f"[ExitVerify] {zone_name} 감시 시작")
 
     for attempt in range(1, EXIT_VERIFY_MAX + 1):
         await asyncio.sleep(EXIT_VERIFY_INTERVAL)
 
-        # Spring Boot에서 DB 상태 조회
-        db_status = await get_zone_status(zone_name)
-        db_status = db_status.lower()
+        db_status = (await get_zone_status(zone_name)).lower()
+        print(f"[ExitVerify] {zone_name} DB: {db_status} ({attempt}/{EXIT_VERIFY_MAX})")
 
-        print(f"[ExitVerify] {zone_name} DB 상태: {db_status} "
-              f"({attempt}/{EXIT_VERIFY_MAX})")
-
-        # DB EMPTY → 정상 반영됨
         if db_status in ("empty", "available", "unknown"):
-            print(f"[ExitVerify] {zone_name} DB EMPTY 확인 → 감시 종료")
+            print(f"[ExitVerify] {zone_name} EMPTY 확인 → 감시 종료")
             return
 
-        # DB OCCUPIED → Spring Boot에 exit 재전송
-        print(f"[ExitVerify] {zone_name} DB 여전히 {db_status} "
-              f"→ exit 재전송 ({attempt}/{EXIT_VERIFY_MAX})")
+        print(f"[ExitVerify] {zone_name} 여전히 {db_status} → exit 재전송")
         try:
             async with httpx.AsyncClient() as client:
                 res = await client.post(
                     SPRING_API["exit"],
-                    json={
-                        "zone":      zone_name,
-                        "exit_time": exit_time,
-                    },
+                    json={"zone": zone_name, "exit_time": exit_time},
                     timeout=8,
                 )
             if res.status_code >= 400:
@@ -153,18 +123,20 @@ async def exit_verify_task(zone_name: str, exit_time: str):
 
 # ── 요청 모델 ─────────────────────────────────────────────
 class ParkingEvent(BaseModel):
-    event:       str
-    zone:        str
-    plate:       Optional[str]  = None
-    park_type:   Optional[str]  = "normal"
-    linked_zone: Optional[str]  = None
-    entry_time:  Optional[str]  = None
-    exit_time:   Optional[str]  = None
-    apartment_no: Optional[int] = None
-    apartmentNo: Optional[int] = None
-    a_no: Optional[int] = None
-    image_path:  Optional[str]  = None
-    ocr_error:   Optional[bool] = False
+    event:        str
+    zone:         str
+    plate:        Optional[str]  = None
+    park_type:    Optional[str]  = "normal"
+    linked_zone:  Optional[str]  = None
+    entry_time:   Optional[str]  = None
+    exit_time:    Optional[str]  = None
+    apartment_no: Optional[int]  = None
+    apartmentNo:  Optional[int]  = None
+    a_no:         Optional[int]  = None
+    # ✅ image_path 대신 image_base64 사용
+    # 2칸주차/통로주차일 때만 값 있음, 일반주차는 None
+    image_base64: Optional[str]  = None
+    ocr_error:    Optional[bool] = False
 
 
 def resolve_apartment_no(event: ParkingEvent) -> int:
@@ -199,7 +171,7 @@ async def handle_entry_quick(event: ParkingEvent):
                     "park_type":   event.park_type,
                     "linked_zone": event.linked_zone,
                     "entry_time":  entry_time,
-                    "image_path":  None,
+                    "image_base64": None,
                 },
                 timeout=8,
             )
@@ -218,7 +190,6 @@ async def handle_entry_quick(event: ParkingEvent):
 
         from routers.gate import start_plate_assignment
         start_plate_assignment(event.zone)
-        print(f"[ENTRY QUICK] {event.zone} 역추적 시작")
 
         return {"result": "ok", "event": "entry_quick", "zone": event.zone}
 
@@ -244,19 +215,19 @@ async def handle_entry(event: ParkingEvent):
             if status == "occupied":
                 if matched_plate:
                     print(f"[ENTRY] {event.zone} 이미 주차중 → 번호판만 업데이트")
-                    res = await client.post(
+                    await client.post(
                         SPRING_API["update_plate"],
                         json={"zone": event.zone, "plate": matched_plate},
                         timeout=8,
                     )
-                    if event.ocr_error and event.image_path:
+                    if event.ocr_error and event.image_base64:
                         try:
                             await client.post(
                                 SPRING_API["alert"],
                                 json={
                                     "zone":       event.zone,
                                     "type":       "ocr_error",
-                                    "candidates": f"OCR 인식 불가 | 이미지: {event.image_path}",
+                                    "candidates": "OCR 인식 불가",
                                     "time":       entry_time,
                                 },
                                 timeout=8,
@@ -266,7 +237,6 @@ async def handle_entry(event: ParkingEvent):
 
                     from routers.gate import remove_from_pending
                     remove_from_pending(matched_plate)
-
                     return {
                         "result":      "ok",
                         "event":       "entry_update",
@@ -286,15 +256,16 @@ async def handle_entry(event: ParkingEvent):
                         detail=f"{event.linked_zone} 이미 주차중 (2칸주차 불가)"
                     )
 
+            # ✅ Spring Boot에 image_base64 포함해서 전달
             res = await client.post(
                 SPRING_API["entry"],
                 json={
-                    "zone":        event.zone,
-                    "plate":       matched_plate,
-                    "park_type":   event.park_type,
-                    "linked_zone": event.linked_zone,
-                    "entry_time":  entry_time,
-                    "image_path":  event.image_path,
+                    "zone":         event.zone,
+                    "plate":        matched_plate,
+                    "park_type":    event.park_type,
+                    "linked_zone":  event.linked_zone,
+                    "entry_time":   entry_time,
+                    "image_base64": event.image_base64,
                 },
                 timeout=8,
             )
@@ -312,12 +283,12 @@ async def handle_entry(event: ParkingEvent):
             try:
                 entry_result = res.json()
             except Exception:
-                entry_result = {}
+                pass
             history_id = (
                 entry_result.get("history_id") or entry_result.get("historyId")
             )
 
-            if event.ocr_error and event.image_path:
+            if event.ocr_error and event.image_base64:
                 try:
                     alert_payload = {
                         "zone":         event.zone,
@@ -325,17 +296,17 @@ async def handle_entry(event: ParkingEvent):
                         "plate":        matched_plate or event.plate,
                         "candidates":   "OCR 인식 불가",
                         "time":         entry_time,
-                        "image_path":   event.image_path,
                         "apartment_no": apartment_no,
                     }
                     if history_id is not None:
                         alert_payload["history_id"] = history_id
                     await client.post(SPRING_API["alert"], json=alert_payload, timeout=8)
-                    print(f"[OCR ERROR] {event.zone} 오류 알림 전송 | {event.image_path}")
+                    print(f"[OCR ERROR] {event.zone} 오류 알림 전송")
                 except Exception as e:
                     print(f"[OCR ERROR] 알림 전송 실패: {e}")
 
-        print(f"[ENTRY] {event.zone} | OCR:{event.plate} → 저장:{matched_plate}")
+        print(f"[ENTRY] {event.zone} | OCR:{event.plate} → 저장:{matched_plate} "
+              f"| 이미지: {'있음' if event.image_base64 else '없음'}")
 
         if matched_plate is None:
             start_plate_assignment(event.zone)
@@ -360,23 +331,13 @@ async def handle_entry(event: ParkingEvent):
 
 # ── 출차 ──────────────────────────────────────────────────
 async def handle_exit(event: ParkingEvent):
-    """
-    출차 처리 흐름:
-      1. Spring Boot에 exit 저장 요청
-      2. 저장 성공 후 백그라운드로 DB 확인 감시 시작
-      3. DB 미반영 시 FastAPI가 알아서 Spring Boot에 재전송
-      카메라는 exit 한 번만 보내면 끝
-    """
     exit_time = event.exit_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     try:
         async with httpx.AsyncClient() as client:
             res = await client.post(
                 SPRING_API["exit"],
-                json={
-                    "zone":      event.zone,
-                    "exit_time": exit_time,
-                },
+                json={"zone": event.zone, "exit_time": exit_time},
                 timeout=8,
             )
 
@@ -388,13 +349,8 @@ async def handle_exit(event: ParkingEvent):
 
         print(f"[EXIT] {event.zone} 저장 완료 → DB 확인 감시 시작")
 
-        # ✅ 백그라운드로 DB 확인 감시 시작
-        # FastAPI가 주기적으로 Spring Boot 조회해서 미반영 시 재전송
         asyncio.create_task(
-            exit_verify_task(
-                zone_name=event.zone,
-                exit_time=exit_time,
-            )
+            exit_verify_task(zone_name=event.zone, exit_time=exit_time)
         )
 
         return {"result": "ok", "event": "exit", "zone": event.zone}
