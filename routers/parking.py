@@ -118,10 +118,14 @@ def resolve_apartment_no(event: ParkingEvent) -> int:
     return event.apartment_no or event.apartmentNo or event.a_no or APARTMENT_NO
 
 
+
 @router.post("/event")
 async def receive_event(event: ParkingEvent):
     """파이 카메라에서 전송한 입출차 이벤트를 수신하고 Spring Boot로 전달."""
-    if event.event == "entry":
+    if event.event == "entry_quick":
+        # ✅ 추가: 번호판 없이 PARKED 상태만 먼저 Spring Boot로 전달
+        return await handle_entry_quick(event)
+    elif event.event == "entry":
         return await handle_entry(event)
     elif event.event == "exit":
         return await handle_exit(event)
@@ -130,10 +134,52 @@ async def receive_event(event: ParkingEvent):
     else:
         raise HTTPException(status_code=400, detail="Unknown event type")
 
+# ── 입차 즉시 PARKED 상태 전송 ────────────────────────────
+async def handle_entry_quick(event: ParkingEvent):
+    entry_time   = event.entry_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# ── 입차 ──────────────────────────────────────────────────
-async def handle_entry(event: ParkingEvent):
-    """
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.post(
+                SPRING_API["entry"],
+                json={
+                    "zone":        event.zone,
+                    "plate":       None,
+                    "park_type":   event.park_type,
+                    "linked_zone": event.linked_zone,
+                    "entry_time":  entry_time,
+                    "image_path":  None,
+                },
+                timeout=8,
+            )
+
+            if res.status_code == 409:
+                print(f"[ENTRY QUICK] {event.zone} 이미 주차중 → 무시")
+                return {"result": "skip", "reason": "already occupied"}
+
+            if res.status_code >= 400:
+                raise HTTPException(
+                    status_code=res.status_code,
+                    detail=f"Spring Boot 에러: {res.text}"
+                )
+
+        print(f"[ENTRY QUICK] {event.zone} PARKED 상태 DB 업데이트 완료")
+
+        # ✅ 추가: entry_quick 후 즉시 역추적 시작
+        # 통로 구역도 번호판 NULL이면 역추적으로 번호판 부여
+        from routers.gate import start_plate_assignment
+        start_plate_assignment(event.zone)
+        print(f"[ENTRY QUICK] {event.zone} 역추적 시작")
+
+        return {"result": "ok", "event": "entry_quick", "zone": event.zone}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ENTRY QUICK] Spring Boot 전달 실패: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+"""
     입차 이벤트 처리 흐름:
     1. 구역 중복 점유 여부 확인
     2. OCR 번호판 보정
@@ -142,6 +188,9 @@ async def handle_entry(event: ParkingEvent):
     5. 번호판 NULL이면 역추적 시작
     ✅ 수정: Spring Boot 저장 실패 시 HTTPException 반환
     """
+
+# ── 입차 ──────────────────────────────────────────────────
+async def handle_entry(event: ParkingEvent):
     from routers.gate import start_plate_assignment
 
     entry_time    = event.entry_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -154,12 +203,49 @@ async def handle_entry(event: ParkingEvent):
             # 구역 중복 점유 확인
             status = await get_zone_status(event.zone)
             if status == "occupied":
-                print(f"[ENTRY] {event.zone} 이미 주차중 → 오류 처리")
-                # ✅ 수정: HTTPException으로 반환
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"{event.zone} 이미 주차중"
-                )
+                # ✅ 수정: entry_quick으로 이미 occupied인 경우
+                # 번호판만 업데이트하고 충돌 처리 안 함
+                if matched_plate:
+                    print(f"[ENTRY] {event.zone} 이미 주차중 → 번호판만 업데이트")
+                    res = await client.post(
+                        SPRING_API["update_plate"],
+                        json={
+                            "zone":  event.zone,
+                            "plate": matched_plate,
+                        },
+                        timeout=8,
+                    )
+                    # OCR 오류 알림 전송
+                    if event.ocr_error and event.image_path:
+                        try:
+                            await client.post(
+                                SPRING_API["alert"],
+                                json={
+                                    "zone":       event.zone,
+                                    "type":       "ocr_error",
+                                    "candidates": f"OCR 인식 불가 | 이미지: {event.image_path}",
+                                    "time":       entry_time,
+                                },
+                                timeout=8,
+                            )
+                        except Exception as e:
+                            print(f"[OCR ERROR] 알림 전송 실패: {e}")
+
+                    # 번호판 인식 성공하면 pending에서 제거
+                    from routers.gate import remove_from_pending
+                    remove_from_pending(matched_plate)
+
+                    return {
+                        "result":      "ok",
+                        "event":       "entry_update",
+                        "zone":        event.zone,
+                        "saved_plate": matched_plate
+                    }
+                else:
+                    # 번호판도 없고 이미 occupied면 역추적만 시작
+                    print(f"[ENTRY] {event.zone} 이미 주차중 + 번호판 없음 → 역추적만")
+                    start_plate_assignment(event.zone)
+                    return {"result": "skip", "reason": "already occupied, no plate"}
 
             # 2칸 주차 시 연결 구역도 확인
             if event.linked_zone:
