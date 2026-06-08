@@ -236,7 +236,13 @@ async def handle_entry(event: ParkingEvent):
         print(f"[ENTRY] {event.zone} | OCR:{event.plate} → 저장:{matched_plate}")
 
         if matched_plate is None:
+            # 번호판 NULL이면 역추적 시작
             start_plate_assignment(event.zone)
+        else:
+            # 번호판 인식 성공하면 pending_plates에서 제거
+            # 역추적 후보에서 빠져야 다른 구역 NULL 차량 매칭 가능
+            from routers.gate import remove_from_pending
+            remove_from_pending(matched_plate)
 
         return {
             "result":      "ok",

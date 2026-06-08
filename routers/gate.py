@@ -114,16 +114,24 @@ async def check_plate(req: CheckPlateRequest):
     )
 
     # gate_open=true인 차량만 역추적 대기 목록에 추가
+   # gate_open=true인 차량만 역추적 대기 목록에 추가
+    # 이미 대기 목록에 있는 번호판은 중복 추가 안 함
     if gate_open and is_registered:
         async with pending_lock:
-            pending_plates.append({
-                "plate":      req.plate,
-                "entered_at": datetime.now()
-            })
-        print(
-            f"[PENDING] {req.plate} 대기 목록 추가 "
-            f"(총 {len(pending_plates)}개)"
-        )
+            already_exists = any(
+                p["plate"] == req.plate for p in pending_plates
+            )
+            if not already_exists:
+                pending_plates.append({
+                    "plate":      req.plate,
+                    "entered_at": datetime.now()
+                })
+                print(
+                    f"[PENDING] {req.plate} 대기 목록 추가 "
+                    f"(총 {len(pending_plates)}개)"
+                )
+            else:
+                print(f"[PENDING] {req.plate} 이미 대기 중 → 중복 추가 생략")
 
     print(
         f"[CHECK PLATE] {req.plate} | "
@@ -356,7 +364,7 @@ async def try_assign_plate_to_null_parking(zone: str):
     print(f"[ASSIGN] {zone} 번호판 NULL → 역추적 시작")
 
     max_retries    = 20
-    retry_interval = 30
+    retry_interval = 5
 
     for attempt in range(max_retries):
         async with pending_lock:
@@ -462,3 +470,18 @@ def start_plate_assignment(zone: str):
     """parking.py에서 번호판 NULL 입차 발생 시 호출."""
     asyncio.create_task(try_assign_plate_to_null_parking(zone))
     print(f"[ASSIGN] {zone} 역추적 백그라운드 시작")
+    
+# ── 8. 번호판 인식 성공 차량 pending에서 제거 ─────────────
+def remove_from_pending(plate: str):
+    """번호판 인식 성공한 차량을 pending_plates에서 제거."""
+    async def _remove():
+        async with pending_lock:
+            before = len(pending_plates)
+            pending_plates[:] = [
+                p for p in pending_plates
+                if p["plate"] != plate
+            ]
+            after = len(pending_plates)
+            if before != after:
+                print(f"[PENDING] {plate} 인식 성공 → 대기 목록 제거")
+    asyncio.create_task(_remove())
