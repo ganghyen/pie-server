@@ -464,6 +464,18 @@ async def try_assign_plate_to_null_parking(zone: str):
         except Exception as e:
             print(f"[ASSIGN] 알림 저장 실패: {e}")
 
+        # ✅ 알림 성공/실패 관계없이 항상 pending 제거
+        async with pending_lock:
+            before = len(pending_plates)
+            pending_plates[:] = [
+                p for p in pending_plates
+                if p["plate"] not in candidates_str
+                and (datetime.now() - p["entered_at"]).total_seconds()
+                <= GATE_CHECK_MINUTES * 60
+            ]
+            after = len(pending_plates)
+            print(f"[ASSIGN] {zone} 후보 제거 완료 ({before}→{after}개)")
+
 
 # ── 7. 외부 호출: 번호판 NULL 입차 시 역추적 시작 ─────────
 def start_plate_assignment(zone: str):
