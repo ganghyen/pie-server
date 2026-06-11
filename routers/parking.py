@@ -214,9 +214,6 @@ async def handle_entry_quick(event: ParkingEvent):
             except Exception as e:
                 print(f"[ENTRY QUICK] linked {linked_zone} 전송 실패: {e}")
 
-        from routers.gate import start_plate_assignment
-        start_plate_assignment(event.zone)
-
         return {"result": "ok", "event": "entry_quick", "zone": event.zone}
 
     except HTTPException:
@@ -339,8 +336,11 @@ async def handle_entry(event: ParkingEvent):
         print(f"[ENTRY] {event.zone} | OCR:{event.plate} → 저장:{matched_plate}")
 
         if matched_plate is None:
+            # OCR 결과 없음(NULL/UNREADABLE) → 그때 역추적 시작
+            print(f"[ENTRY] {event.zone} 번호판 없음 → 역추적 시작")
             start_plate_assignment(event.zone)
         else:
+            # OCR 성공 → pending 제거 (역추적 불필요)
             from routers.gate import remove_from_pending
             remove_from_pending(matched_plate)
 
