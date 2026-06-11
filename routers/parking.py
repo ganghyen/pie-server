@@ -1,3 +1,5 @@
+# 파일: ~/parking_project/pie/pie/server/routers/parking.py
+
 # ============================================================
 # 주차 이벤트 라우터 (파이 → FastAPI → Spring Boot)
 # ============================================================
@@ -13,6 +15,11 @@ from config import SPRING_API, PLATE_MATCH_THRESHOLD, APARTMENT_NO
 
 # ✅ 구역별 linked_zone 메모리 (역추적 시 사용)
 zone_linked_map: dict[str, str] = {}
+
+# ✅ 구역별 확정 번호판 메모리 (update 중복 방지용)
+# entry/entry_quick 때 저장, exit 때 제거
+# Spring Boot DB 조회 없이 FastAPI 메모리로 체크
+zone_plate_map: dict[str, str] = {}
 
 router = APIRouter()
 
@@ -186,6 +193,9 @@ async def handle_entry_quick(event: ParkingEvent):
             zone_linked_map[event.linked_zone] = event.zone
             print(f"[LINKED] {event.zone} ↔ {event.linked_zone} 쌍 저장")
 
+        # ✅ entry_quick은 번호판 없으므로 zone_plate_map 저장 안 함
+        # entry(OCR 완료) 때 저장
+
         print(f"[ENTRY QUICK] {event.zone} PARKED 상태 DB 업데이트 완료")
 
         # ✅ linked_zone도 독립 entry로 전송 (linked_zone=None으로)
@@ -213,6 +223,9 @@ async def handle_entry_quick(event: ParkingEvent):
                     print(f"[ENTRY QUICK] linked {linked_zone} PARKED 상태 DB 업데이트 완료")
             except Exception as e:
                 print(f"[ENTRY QUICK] linked {linked_zone} 전송 실패: {e}")
+
+        # ✅ entry_quick에서는 역추적 시작 안 함
+        # OCR 결과(entry) 수신 후 번호판 없을 때만 역추적
 
         return {"result": "ok", "event": "entry_quick", "zone": event.zone}
 
@@ -243,6 +256,11 @@ async def handle_entry(event: ParkingEvent):
                         json={"zone": event.zone, "plate": matched_plate},
                         timeout=8,
                     )
+
+                    # ✅ 메모리에 번호판 확정 저장
+                    zone_plate_map[event.zone] = matched_plate
+                    print(f"[PlateMap] {event.zone} → {matched_plate} 저장")
+
                     if event.ocr_error and event.image_base64:
                         try:
                             await client.post(
@@ -270,6 +288,7 @@ async def handle_entry(event: ParkingEvent):
                                 json={"zone": linked, "plate": matched_plate},
                                 timeout=8,
                             )
+                            zone_plate_map[linked] = matched_plate
                             print(f"[LINKED] {event.zone} 번호판 {matched_plate} → {linked} 전송")
                         except Exception as e:
                             print(f"[LINKED] {linked} 번호판 전송 실패: {e}")
@@ -336,11 +355,14 @@ async def handle_entry(event: ParkingEvent):
         print(f"[ENTRY] {event.zone} | OCR:{event.plate} → 저장:{matched_plate}")
 
         if matched_plate is None:
-            # OCR 결과 없음(NULL/UNREADABLE) → 그때 역추적 시작
+            # ✅ OCR 결과 없음 → 역추적 시작
             print(f"[ENTRY] {event.zone} 번호판 없음 → 역추적 시작")
             start_plate_assignment(event.zone)
         else:
-            # OCR 성공 → pending 제거 (역추적 불필요)
+            # ✅ OCR 성공 → 메모리에 번호판 확정 저장 + pending 제거
+            zone_plate_map[event.zone] = matched_plate
+            print(f"[PlateMap] {event.zone} → {matched_plate} 저장")
+
             from routers.gate import remove_from_pending
             remove_from_pending(matched_plate)
 
@@ -354,6 +376,7 @@ async def handle_entry(event: ParkingEvent):
                             json={"zone": linked, "plate": matched_plate},
                             timeout=8,
                         )
+                    zone_plate_map[linked] = matched_plate
                     print(f"[LINKED] {event.zone} 번호판 {matched_plate} → {linked} 전송")
                 except Exception as e:
                     print(f"[LINKED] {linked} 번호판 전송 실패: {e}")
@@ -402,10 +425,16 @@ async def handle_exit(event: ParkingEvent):
             from routers.gate import remove_from_pending
             remove_from_pending(event.plate)
 
+        # ✅ 출차 시 zone_plate_map에서 번호판 제거
+        removed_plate = zone_plate_map.pop(event.zone, None)
+        if removed_plate:
+            print(f"[PlateMap] {event.zone} → {removed_plate} 제거")
+
         # ✅ 출차 시 linked_zone 쌍 메모리에서 제거
         linked = zone_linked_map.pop(event.zone, None)
         if linked:
             zone_linked_map.pop(linked, None)
+            zone_plate_map.pop(linked, None)
             print(f"[LINKED] {event.zone} ↔ {linked} 쌍 제거")
 
         return {"result": "ok", "event": "exit", "zone": event.zone}
@@ -421,6 +450,17 @@ async def handle_exit(event: ParkingEvent):
 async def handle_update(event: ParkingEvent):
     matched_plate = await match_plate(event.plate) if event.plate else None
 
+    # ✅ 메모리에 이미 확정 번호판 있으면 스킵 (Spring Boot 조회 불필요)
+    existing_plate = zone_plate_map.get(event.zone)
+    if existing_plate and existing_plate not in (None, "", "UNKNOWN"):
+        print(f"[UPDATE] {event.zone} 메모리에 번호판 있음({existing_plate}) → 스킵")
+        return {"result": "skip", "reason": "plate already exists", "plate": existing_plate}
+
+    # OCR 결과도 없으면 스킵
+    if not matched_plate:
+        print(f"[UPDATE] {event.zone} OCR 결과 없음 → 스킵")
+        return {"result": "skip", "reason": "no plate to update"}
+
     try:
         async with httpx.AsyncClient() as client:
             res = await client.post(
@@ -434,6 +474,10 @@ async def handle_update(event: ParkingEvent):
                     detail=f"Spring Boot 에러: {res.text}"
                 )
 
+            # ✅ 업데이트 성공 시 메모리에 번호판 저장
+            zone_plate_map[event.zone] = matched_plate
+            print(f"[PlateMap] {event.zone} → {matched_plate} 저장 (update)")
+
             # ✅ linked_zone도 같은 번호판으로 업데이트
             linked = zone_linked_map.get(event.zone) or event.linked_zone
             if linked and matched_plate:
@@ -443,6 +487,7 @@ async def handle_update(event: ParkingEvent):
                         json={"zone": linked, "plate": matched_plate},
                         timeout=8,
                     )
+                    zone_plate_map[linked] = matched_plate
                     print(f"[UPDATE] linked {linked} → {matched_plate} 업데이트")
                 except Exception as e:
                     print(f"[UPDATE] linked {linked} 업데이트 실패: {e}")
