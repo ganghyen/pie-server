@@ -4,7 +4,7 @@
 
 # Spring Boot 서버 주소
 # ⚠️ 시연 전 실제 실행 환경 IP로 확인 필요
-SPRING_BOOT_URL = "http://172.20.10.13:8080"
+SPRING_BOOT_URL = "http://springweb-env.eba-shnyk9a8.ap-northeast-2.elasticbeanstalk.com"
 
 # 현재 Python 장비가 연결된 아파트 번호
 # 여러 아파트를 운영하면 장비별로 이 값을 바꿔서 사용

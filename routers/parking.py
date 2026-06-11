@@ -1,11 +1,5 @@
 # ============================================================
-# 주차 이벤트 라우터 (파이 → FastAPI → Spring Boot) 2
-#
-# 수정사항:
-#   1. image_path → image_base64 로 변경
-#      2칸주차/통로주차일 때만 base64 이미지 전달
-#   2. Spring Boot 저장 실패 시 HTTPException으로 실패 상태코드 반환
-#   3. 출차 후 DB 확인/재전송 FastAPI가 전담
+# 주차 이벤트 라우터 (파이 → FastAPI → Spring Boot)
 # ============================================================
 
 from fastapi import APIRouter, HTTPException
@@ -16,6 +10,9 @@ import asyncio
 import Levenshtein
 import httpx
 from config import SPRING_API, PLATE_MATCH_THRESHOLD, APARTMENT_NO
+
+# ✅ 구역별 linked_zone 메모리 (역추적 시 사용)
+zone_linked_map: dict[str, str] = {}
 
 router = APIRouter()
 
@@ -34,7 +31,6 @@ async def match_plate(ocr_plate: str) -> str:
             try:
                 data = response.json()
             except Exception:
-                print(f"[PlateMatch] 응답 파싱 실패 → 원본 사용")
                 return ocr_plate
             registered = [car["c_number"] for car in data]
     except Exception as e:
@@ -133,8 +129,6 @@ class ParkingEvent(BaseModel):
     apartment_no: Optional[int]  = None
     apartmentNo:  Optional[int]  = None
     a_no:         Optional[int]  = None
-    # ✅ image_path 대신 image_base64 사용
-    # 2칸주차/통로주차일 때만 값 있음, 일반주차는 None
     image_base64: Optional[str]  = None
     ocr_error:    Optional[bool] = False
 
@@ -166,11 +160,11 @@ async def handle_entry_quick(event: ParkingEvent):
             res = await client.post(
                 SPRING_API["entry"],
                 json={
-                    "zone":        event.zone,
-                    "plate":       None,
-                    "park_type":   event.park_type,
-                    "linked_zone": event.linked_zone,
-                    "entry_time":  entry_time,
+                    "zone":         event.zone,
+                    "plate":        None,
+                    "park_type":    event.park_type,
+                    "linked_zone":  None,
+                    "entry_time":   entry_time,
                     "image_base64": None,
                 },
                 timeout=8,
@@ -186,7 +180,39 @@ async def handle_entry_quick(event: ParkingEvent):
                     detail=f"Spring Boot 에러: {res.text}"
                 )
 
+        # ✅ linked_zone 쌍 메모리에 저장
+        if event.linked_zone:
+            zone_linked_map[event.zone]        = event.linked_zone
+            zone_linked_map[event.linked_zone] = event.zone
+            print(f"[LINKED] {event.zone} ↔ {event.linked_zone} 쌍 저장")
+
         print(f"[ENTRY QUICK] {event.zone} PARKED 상태 DB 업데이트 완료")
+
+        # ✅ linked_zone도 독립 entry로 전송 (linked_zone=None으로)
+        linked_zone = event.linked_zone
+        if linked_zone:
+            try:
+                async with httpx.AsyncClient() as client:
+                    res = await client.post(
+                        SPRING_API["entry"],
+                        json={
+                            "zone":         linked_zone,
+                            "plate":        None,
+                            "park_type":    event.park_type,
+                            "linked_zone":  None,
+                            "entry_time":   entry_time,
+                            "image_base64": None,
+                        },
+                        timeout=8,
+                    )
+                if res.status_code == 409:
+                    print(f"[ENTRY QUICK] linked {linked_zone} 이미 주차중 → 무시")
+                elif res.status_code >= 400:
+                    print(f"[ENTRY QUICK] linked {linked_zone} 에러: {res.status_code}")
+                else:
+                    print(f"[ENTRY QUICK] linked {linked_zone} PARKED 상태 DB 업데이트 완료")
+            except Exception as e:
+                print(f"[ENTRY QUICK] linked {linked_zone} 전송 실패: {e}")
 
         from routers.gate import start_plate_assignment
         start_plate_assignment(event.zone)
@@ -237,6 +263,20 @@ async def handle_entry(event: ParkingEvent):
 
                     from routers.gate import remove_from_pending
                     remove_from_pending(matched_plate)
+
+                    # ✅ linked_zone도 같은 번호판 업데이트
+                    linked = zone_linked_map.get(event.zone)
+                    if linked and matched_plate:
+                        try:
+                            await client.post(
+                                SPRING_API["update_plate"],
+                                json={"zone": linked, "plate": matched_plate},
+                                timeout=8,
+                            )
+                            print(f"[LINKED] {event.zone} 번호판 {matched_plate} → {linked} 전송")
+                        except Exception as e:
+                            print(f"[LINKED] {linked} 번호판 전송 실패: {e}")
+
                     return {
                         "result":      "ok",
                         "event":       "entry_update",
@@ -248,22 +288,13 @@ async def handle_entry(event: ParkingEvent):
                     start_plate_assignment(event.zone)
                     return {"result": "skip", "reason": "already occupied, no plate"}
 
-            if event.linked_zone:
-                linked_status = await get_zone_status(event.linked_zone)
-                if linked_status == "occupied":
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"{event.linked_zone} 이미 주차중 (2칸주차 불가)"
-                    )
-
-            # ✅ Spring Boot에 image_base64 포함해서 전달
             res = await client.post(
                 SPRING_API["entry"],
                 json={
                     "zone":         event.zone,
                     "plate":        matched_plate,
                     "park_type":    event.park_type,
-                    "linked_zone":  event.linked_zone,
+                    "linked_zone":  None,
                     "entry_time":   entry_time,
                     "image_base64": event.image_base64,
                 },
@@ -305,14 +336,27 @@ async def handle_entry(event: ParkingEvent):
                 except Exception as e:
                     print(f"[OCR ERROR] 알림 전송 실패: {e}")
 
-        print(f"[ENTRY] {event.zone} | OCR:{event.plate} → 저장:{matched_plate} "
-              f"| 이미지: {'있음' if event.image_base64 else '없음'}")
+        print(f"[ENTRY] {event.zone} | OCR:{event.plate} → 저장:{matched_plate}")
 
         if matched_plate is None:
             start_plate_assignment(event.zone)
         else:
             from routers.gate import remove_from_pending
             remove_from_pending(matched_plate)
+
+            # ✅ linked_zone 있으면 같은 번호판 전송
+            linked = zone_linked_map.get(event.zone)
+            if linked and matched_plate:
+                try:
+                    async with httpx.AsyncClient() as client:
+                        await client.post(
+                            SPRING_API["update_plate"],
+                            json={"zone": linked, "plate": matched_plate},
+                            timeout=8,
+                        )
+                    print(f"[LINKED] {event.zone} 번호판 {matched_plate} → {linked} 전송")
+                except Exception as e:
+                    print(f"[LINKED] {linked} 번호판 전송 실패: {e}")
 
         return {
             "result":      "ok",
@@ -353,6 +397,17 @@ async def handle_exit(event: ParkingEvent):
             exit_verify_task(zone_name=event.zone, exit_time=exit_time)
         )
 
+        # ✅ 출차 시 번호판 pending에서 제거
+        if event.plate:
+            from routers.gate import remove_from_pending
+            remove_from_pending(event.plate)
+
+        # ✅ 출차 시 linked_zone 쌍 메모리에서 제거
+        linked = zone_linked_map.pop(event.zone, None)
+        if linked:
+            zone_linked_map.pop(linked, None)
+            print(f"[LINKED] {event.zone} ↔ {linked} 쌍 제거")
+
         return {"result": "ok", "event": "exit", "zone": event.zone}
 
     except HTTPException:
@@ -373,12 +428,24 @@ async def handle_update(event: ParkingEvent):
                 json={"zone": event.zone, "plate": matched_plate},
                 timeout=8,
             )
-
             if res.status_code >= 400:
                 raise HTTPException(
                     status_code=res.status_code,
                     detail=f"Spring Boot 에러: {res.text}"
                 )
+
+            # ✅ linked_zone도 같은 번호판으로 업데이트
+            linked = zone_linked_map.get(event.zone) or event.linked_zone
+            if linked and matched_plate:
+                try:
+                    await client.post(
+                        SPRING_API["update_plate"],
+                        json={"zone": linked, "plate": matched_plate},
+                        timeout=8,
+                    )
+                    print(f"[UPDATE] linked {linked} → {matched_plate} 업데이트")
+                except Exception as e:
+                    print(f"[UPDATE] linked {linked} 업데이트 실패: {e}")
 
         print(f"[UPDATE] {event.zone} | OCR:{event.plate} → 저장:{matched_plate}")
         return {

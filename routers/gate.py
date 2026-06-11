@@ -1,13 +1,5 @@
 # ============================================================
 # 입구 차단기 라우터
-# 등록 차량 확인 / 차단기 제어 / 이중주차 역추적
-#
-# 수정사항:
-#   1. check_plate: Python 자체 80% 판단 제거
-#   2. 역추적: 구역별 → 전체 한 번에 처리로 변경
-#      - 5초마다 20번 반복
-#      - 대기 1개 + 언노운 1개 → 즉시 매칭
-#      - 대기 여러개 or 언노운 여러개 → NULL 유지 + 알림
 # ============================================================
 
 from fastapi import APIRouter
@@ -23,7 +15,6 @@ router = APIRouter()
 pending_plates: list[dict] = []
 pending_lock = asyncio.Lock()
 
-# 전역 역추적 태스크 실행 여부
 _assign_task_running = False
 _assign_task_lock    = asyncio.Lock()
 
@@ -85,7 +76,6 @@ async def check_plate(req: CheckPlateRequest):
     gate_open     = bool(data.get("gate_open", False))
     is_registered = bool(data.get("is_registered", data.get("is_resident", False)))
 
-    # gate_open=true 이고 등록 차량일 때만 pending 추가
     if gate_open and is_registered:
         async with pending_lock:
             already_exists = any(p["plate"] == req.plate for p in pending_plates)
@@ -207,7 +197,6 @@ async def gate_status(
 
 # ── 5. UNKNOWN 주차 기록 전체 조회 ───────────────────────
 async def get_all_unmatched_histories() -> list[dict]:
-    """번호판이 UNKNOWN인 진행 중 주차 기록 전체 반환."""
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(SPRING_API["unmatched"], timeout=8)
@@ -237,22 +226,33 @@ async def assign_plate_to_history(history_id: int, plate: str) -> bool:
         return False
 
 
-# ── 7. 전체 역추적 태스크 ─────────────────────────────────
+# ── 7. linked_zone 번호판 업데이트 헬퍼 ──────────────────
+async def update_linked_zone(matched_unknown: dict, plate: str):
+    """역추적 성공 시 linked_zone도 같은 번호판으로 업데이트."""
+    from routers.parking import zone_linked_map
+    matched_zone = (
+        matched_unknown.get("zone") or
+        matched_unknown.get("history_zone")
+    )
+    linked_zone = (
+        matched_unknown.get("linked_zone") or
+        zone_linked_map.get(matched_zone)
+    )
+    if linked_zone:
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    SPRING_API["update_plate"],
+                    json={"zone": linked_zone, "plate": plate},
+                    timeout=8,
+                )
+            print(f"[ASSIGN] linked {linked_zone} → {plate} 업데이트")
+        except Exception as e:
+            print(f"[ASSIGN] linked 업데이트 실패: {e}")
+
+
+# ── 8. 전체 역추적 태스크 ─────────────────────────────────
 async def global_assign_task():
-    """
-    전체 역추적 로직:
-    5초마다 20번 반복
-    
-    매 시도마다:
-      1. pending(입구 통과 차량) 만료 정리
-      2. DB에서 UNKNOWN 주차 기록 전체 조회
-      3. 매칭 시도:
-         - 대기 1개 + 언노운 1개 → 즉시 매칭
-         - 대기 1개 + 언노운 여러개 → 가장 최근 언노운에 매칭
-         - 대기 여러개 + 언노운 1개 → 특정 불가, NULL 유지
-         - 대기 여러개 + 언노운 여러개 → NULL 유지 + 알림
-      4. pending 비거나 언노운 없으면 종료
-    """
     global _assign_task_running
 
     max_retries    = 20
@@ -263,7 +263,6 @@ async def global_assign_task():
     for attempt in range(max_retries):
         await asyncio.sleep(retry_interval)
 
-        # pending 만료 정리
         async with pending_lock:
             now     = datetime.now()
             expired = [
@@ -279,7 +278,6 @@ async def global_assign_task():
             print(f"[ASSIGN] 대기 번호판 없음 → 역추적 종료")
             break
 
-        # DB에서 UNKNOWN 주차 기록 전체 조회
         histories = await get_all_unmatched_histories()
         unknowns  = [
             h for h in histories
@@ -292,43 +290,37 @@ async def global_assign_task():
             print(f"[ASSIGN] UNKNOWN 주차 기록 없음 → 대기 유지 ({attempt+1}/{max_retries})")
             continue
 
-        print(f"[ASSIGN] 대기:{len(candidates)}개 | 언노운:{len(unknowns)}개 "
-              f"({attempt+1}/{max_retries})")
+        print(f"[ASSIGN] 대기:{len(candidates)}개 | 언노운:{len(unknowns)}개 ({attempt+1}/{max_retries})")
+        if candidates:
+            print(f"[ASSIGN] 대기 목록: {[p['plate'] for p in candidates]}")
 
         # ── 매칭 로직 ──────────────────────────────────
         if len(candidates) == 1 and len(unknowns) == 1:
-            # 대기 1개 + 언노운 1개 → 즉시 매칭
             plate      = candidates[0]["plate"]
             history_id = unknowns[0].get("history_id")
             if history_id and await assign_plate_to_history(int(history_id), plate):
                 async with pending_lock:
                     pending_plates[:] = [p for p in pending_plates if p["plate"] != plate]
                 print(f"[ASSIGN] 매칭 완료: {plate} → history:{history_id}")
+                await update_linked_zone(unknowns[0], plate)
             continue
 
         if len(candidates) == 1 and len(unknowns) > 1:
-            # 대기 1개 + 언노운 여러개 → 가장 최근 언노운에 매칭
-            plate = candidates[0]["plate"]
-            # entry_time 기준 가장 최근 언노운
-            latest = max(
-                unknowns,
-                key=lambda h: h.get("entry_time", "") or ""
-            )
+            plate  = candidates[0]["plate"]
+            latest = max(unknowns, key=lambda h: h.get("entry_time", "") or "")
             history_id = latest.get("history_id")
             if history_id and await assign_plate_to_history(int(history_id), plate):
                 async with pending_lock:
                     pending_plates[:] = [p for p in pending_plates if p["plate"] != plate]
                 print(f"[ASSIGN] 최근 언노운에 매칭: {plate} → history:{history_id}")
+                await update_linked_zone(latest, plate)
             continue
 
         if len(candidates) > 1 and len(unknowns) == 1:
-            # 대기 여러개 + 언노운 1개 → 특정 불가, 계속 대기
-            print(f"[ASSIGN] 대기 여러개({len(candidates)}) + 언노운 1개 "
-                  f"→ 특정 불가, 대기 유지")
+            print(f"[ASSIGN] 대기 여러개({len(candidates)}) + 언노운 1개 → 특정 불가, 대기 유지")
             continue
 
         if len(candidates) > 1 and len(unknowns) > 1:
-            # 대기 여러개 + 언노운 여러개 → NULL 유지 + 알림
             candidates_str = ",".join([p["plate"] for p in candidates])
             print(f"[ASSIGN] 대기 여러개 + 언노운 여러개 → 알림 전송")
             try:
@@ -345,7 +337,6 @@ async def global_assign_task():
             except Exception as e:
                 print(f"[ASSIGN] 알림 전송 실패: {e}")
 
-            # 만료된 항목 정리
             async with pending_lock:
                 pending_plates[:] = [
                     p for p in pending_plates
@@ -359,12 +350,8 @@ async def global_assign_task():
         _assign_task_running = False
 
 
-# ── 8. 역추적 시작 (외부 호출용) ─────────────────────────
+# ── 9. 역추적 시작 (외부 호출용) ─────────────────────────
 def start_plate_assignment(zone: str = ""):
-    """
-    parking.py에서 번호판 NULL 입차 발생 시 호출.
-    전체 역추적 태스크가 이미 실행 중이면 새로 시작 안 함.
-    """
     async def _start():
         global _assign_task_running
         async with _assign_task_lock:
@@ -372,14 +359,12 @@ def start_plate_assignment(zone: str = ""):
                 print(f"[ASSIGN] 역추적 이미 실행 중 → 스킵 (zone={zone})")
                 return
             _assign_task_running = True
-
         asyncio.create_task(global_assign_task())
         print(f"[ASSIGN] 전체 역추적 백그라운드 시작 (zone={zone})")
-
     asyncio.create_task(_start())
 
 
-# ── 9. 번호판 인식 성공 차량 pending에서 제거 ─────────────
+# ── 10. 번호판 인식 성공 차량 pending에서 제거 ────────────
 def remove_from_pending(plate: str):
     async def _remove():
         async with pending_lock:
