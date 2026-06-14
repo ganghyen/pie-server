@@ -1,5 +1,5 @@
 # ============================================================
-# 스마트 주차 관리 시스템 - FastAPI 서버 메인
+# 스마트 주차 관리 시스템 - FastAPI 서버 메인  10
 # ============================================================
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
