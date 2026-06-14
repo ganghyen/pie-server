@@ -10,7 +10,7 @@ from typing import Optional
 from datetime import datetime
 import asyncio
 import httpx
-from config import SPRING_API, PLATE_MATCH_THRESHOLD, APARTMENT_NO
+from config import SPRING_API, PLATE_MATCH_THRESHOLD, APARTMENT_NO, AISLE_ZONES
 from plate_matcher import evaluate_plate_match
 
 # ✅ 구역별 linked_zone 메모리 (역추적 시 사용)
@@ -25,6 +25,11 @@ router = APIRouter()
 
 EXIT_VERIFY_INTERVAL = 30.0
 EXIT_VERIFY_MAX      = 10
+
+
+# ── 통로 구역 여부 확인 (하드코딩된 목록 기준) ────────────
+def is_aisle_zone(zone_name: str) -> bool:
+    return zone_name in AISLE_ZONES
 
 
 # ── OCR 오인식 보정 ───────────────────────────────────────
@@ -77,6 +82,21 @@ def correction_payload(match_result: dict | None) -> dict:
     }
 
 
+def build_update_plate_payload(
+        event: "ParkingEvent",
+        plate: str | None,
+        match_result: dict | None = None,
+) -> dict:
+    payload = {
+        "zone":  event.zone,
+        "plate": plate,
+        **correction_payload(match_result),
+    }
+    if event.image_base64:
+        payload["image_base64"] = event.image_base64
+    return payload
+
+
 # ── 구역 상태 조회 ────────────────────────────────────────
 async def get_zone_status(zone: str) -> str:
     try:
@@ -100,7 +120,7 @@ async def exit_verify_task(zone_name: str, exit_time: str):
     print(f"[ExitVerify] {zone_name} 감시 시작")
 
     for attempt in range(1, EXIT_VERIFY_MAX + 1):
-        await asyncio.sleep(EXIT_VERIFY_INTERVAL)#
+        await asyncio.sleep(EXIT_VERIFY_INTERVAL)
 
         db_status = (await get_zone_status(zone_name)).lower()
         print(f"[ExitVerify] {zone_name} DB: {db_status} ({attempt}/{EXIT_VERIFY_MAX})")
@@ -196,48 +216,16 @@ async def handle_entry_quick(event: ParkingEvent):
             zone_linked_map[event.linked_zone] = event.zone
             print(f"[LINKED] {event.zone} ↔ {event.linked_zone} 쌍 저장")
 
-        # ✅ entry_quick은 번호판 없으므로 zone_plate_map 저장 안 함
-        # entry(OCR 완료) 때 저장
-
         print(f"[ENTRY QUICK] {event.zone} PARKED 상태 DB 업데이트 완료")
 
-        # ✅ linked_zone도 독립 entry로 전송 (linked_zone=None으로)
-        linked_zone = event.linked_zone
-        if linked_zone:
-            try:
-                async with httpx.AsyncClient() as client:
-                    res = await client.post(
-                        SPRING_API["entry"],
-                        json={
-                            "zone":         linked_zone,
-                            "plate":        None,
-                            "park_type":    event.park_type,
-                            "linked_zone":  None,
-                            "entry_time":   entry_time,
-                            "image_base64": None,
-                        },
-                        timeout=8,
-                    )
-                if res.status_code == 409:
-                    print(f"[ENTRY QUICK] linked {linked_zone} 이미 주차중 → 무시")
-                elif res.status_code >= 400:
-                    print(f"[ENTRY QUICK] linked {linked_zone} 에러: {res.status_code}")
-                else:
-                    print(f"[ENTRY QUICK] linked {linked_zone} PARKED 상태 DB 업데이트 완료")
-            except Exception as e:
-                print(f"[ENTRY QUICK] linked {linked_zone} 전송 실패: {e}")
-
-        # ✅ entry_quick에서는 역추적 시작 안 함
-        # OCR 결과(entry) 수신 후 번호판 없을 때만 역추적
-
-        
-
-        # ✅ 통로주차는 OCR 기다리지 않고 즉시 역추적 시작
-        # 일반주차는 OCR 결과(entry) 수신 후 번호판 없을 때만 역추적
-        if event.park_type == "aisle_block":
+        # ✅ 통로구역(하드코딩 목록) 또는 통로주차(카메라 판단)면
+        # OCR 기다리지 않고 즉시 역추적 시작
+        zone_is_aisle = is_aisle_zone(event.zone)
+        if zone_is_aisle or event.park_type == "aisle_block":
             from routers.gate import start_plate_assignment
             start_plate_assignment(event.zone, immediate=True)
-            print(f"[ENTRY QUICK] {event.zone} 통로주차 → 역추적 즉시 시작")
+            reason = "통로구역(하드코딩)" if zone_is_aisle else "통로주차(카메라)"
+            print(f"[ENTRY QUICK] {event.zone} {reason} → 역추적 즉시 시작")
 
         return {"result": "ok", "event": "entry_quick", "zone": event.zone}
 
@@ -266,11 +254,10 @@ async def handle_entry(event: ParkingEvent):
                     print(f"[ENTRY] {event.zone} 이미 주차중 → 번호판만 업데이트")
                     await client.post(
                         SPRING_API["update_plate"],
-                        json={"zone": event.zone, "plate": matched_plate},
+                        json=build_update_plate_payload(event, matched_plate, plate_match),
                         timeout=8,
                     )
 
-                    # ✅ 메모리에 번호판 확정 저장
                     zone_plate_map[event.zone] = matched_plate
                     print(f"[PlateMap] {event.zone} → {matched_plate} 저장")
 
@@ -292,7 +279,6 @@ async def handle_entry(event: ParkingEvent):
                     from routers.gate import remove_from_pending
                     remove_from_pending(matched_plate)
 
-                    # ✅ linked_zone도 같은 번호판 업데이트
                     linked = zone_linked_map.get(event.zone)
                     if linked and matched_plate:
                         try:
@@ -316,16 +302,19 @@ async def handle_entry(event: ParkingEvent):
                     print(f"[ENTRY] {event.zone} 이미 주차중 + 후보 검토 필요 → 검토 기록 저장")
                     await client.post(
                         SPRING_API["update_plate"],
-                        json={
-                            "zone": event.zone,
-                            "plate": None,
-                            **correction_payload(plate_match),
-                        },
+                        json=build_update_plate_payload(event, None, plate_match),
                         timeout=8,
                     )
                     return {"result": "review_required", "zone": event.zone}
                 else:
-                    print(f"[ENTRY] {event.zone} 이미 주차중 + 번호판 없음 → 역추적만")
+                    if event.ocr_error and event.image_base64:
+                        print(f"[ENTRY] {event.zone} 이미 주차중 + OCR 실패 이미지 → 주차 이력 이미지 업데이트")
+                        await client.post(
+                            SPRING_API["update_plate"],
+                            json=build_update_plate_payload(event, None, plate_match),
+                            timeout=8,
+                        )
+                    print(f"[ENTRY] {event.zone} 이미 주차중 + 번호판 없음 → 역추적")
                     start_plate_assignment(event.zone)
                     return {"result": "skip", "reason": "already occupied, no plate"}
 
@@ -381,18 +370,15 @@ async def handle_entry(event: ParkingEvent):
         print(f"[ENTRY] {event.zone} | OCR:{event.plate} → 저장:{matched_plate}")
 
         if matched_plate is None:
-            # ✅ OCR 결과 없음 → 역추적 시작
             print(f"[ENTRY] {event.zone} 번호판 없음 → 역추적 시작")
             start_plate_assignment(event.zone)
         else:
-            # ✅ OCR 성공 → 메모리에 번호판 확정 저장 + pending 제거
             zone_plate_map[event.zone] = matched_plate
             print(f"[PlateMap] {event.zone} → {matched_plate} 저장")
 
             from routers.gate import remove_from_pending
             remove_from_pending(matched_plate)
 
-            # ✅ linked_zone 있으면 같은 번호판 전송
             linked = zone_linked_map.get(event.zone)
             if linked and matched_plate:
                 try:
@@ -446,17 +432,14 @@ async def handle_exit(event: ParkingEvent):
             exit_verify_task(zone_name=event.zone, exit_time=exit_time)
         )
 
-        # ✅ 출차 시 번호판 pending에서 제거
         if event.plate:
             from routers.gate import remove_from_pending
             remove_from_pending(event.plate)
 
-        # ✅ 출차 시 zone_plate_map에서 번호판 제거
         removed_plate = zone_plate_map.pop(event.zone, None)
         if removed_plate:
             print(f"[PlateMap] {event.zone} → {removed_plate} 제거")
 
-        # ✅ 출차 시 linked_zone 쌍 메모리에서 제거
         linked = zone_linked_map.pop(event.zone, None)
         if linked:
             zone_linked_map.pop(linked, None)
@@ -477,13 +460,11 @@ async def handle_update(event: ParkingEvent):
     plate_match   = await match_plate(event.plate) if event.plate else None
     matched_plate = matched_plate_value(plate_match)
 
-    # ✅ 메모리에 이미 확정 번호판 있으면 스킵 (Spring Boot 조회 불필요)
     existing_plate = zone_plate_map.get(event.zone)
     if existing_plate and existing_plate not in (None, "", "UNKNOWN"):
         print(f"[UPDATE] {event.zone} 메모리에 번호판 있음({existing_plate}) → 스킵")
         return {"result": "skip", "reason": "plate already exists", "plate": existing_plate}
 
-    # OCR 결과도 없으면 스킵
     if not matched_plate and not (plate_match and plate_match.get("needs_review")):
         print(f"[UPDATE] {event.zone} OCR 결과 없음 → 스킵")
         return {"result": "skip", "reason": "no plate to update"}
@@ -492,11 +473,7 @@ async def handle_update(event: ParkingEvent):
         async with httpx.AsyncClient() as client:
             res = await client.post(
                 SPRING_API["update_plate"],
-                json={
-                    "zone": event.zone,
-                    "plate": matched_plate,
-                    **correction_payload(plate_match),
-                },
+                json=build_update_plate_payload(event, matched_plate, plate_match),
                 timeout=8,
             )
             if res.status_code >= 400:
@@ -505,11 +482,9 @@ async def handle_update(event: ParkingEvent):
                     detail=f"Spring Boot 에러: {res.text}"
                 )
 
-            # ✅ 업데이트 성공 시 메모리에 번호판 저장
             zone_plate_map[event.zone] = matched_plate
             print(f"[PlateMap] {event.zone} → {matched_plate} 저장 (update)")
 
-            # ✅ linked_zone도 같은 번호판으로 업데이트
             linked = zone_linked_map.get(event.zone) or event.linked_zone
             if linked and matched_plate:
                 try:
