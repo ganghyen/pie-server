@@ -77,9 +77,16 @@ async def check_plate(req: CheckPlateRequest):
     is_registered = bool(data.get("is_registered", data.get("is_resident", False)))
 
     if gate_open and is_registered:
+        # 이미 주차장 칸에서 번호까지 확인된 차는 대기 목록에 다시 넣지 않는다.
+        # (입구 카메라가 같은 차를 늦게 다시 읽으면 주차 확인 뒤에 다시 들어가
+        #  통로 차량 역추적 후보가 여러 개가 되어 매칭이 멈췄음, 2026-11-02 테스트)
+        from routers.parking import zone_plate_map
+        already_parked = req.plate in zone_plate_map.values()
         async with pending_lock:
             already_exists = any(p["plate"] == req.plate for p in pending_plates)
-            if not already_exists:
+            if already_parked:
+                print(f"[PENDING] {req.plate} 이미 주차 칸에서 확인된 차량 → 대기 목록 추가 생략")
+            elif not already_exists:
                 pending_plates.append({
                     "plate":      req.plate,
                     "entered_at": datetime.now()

@@ -6,7 +6,7 @@ import os
 
 # Spring Boot 서버 주소 (백엔드는 노트북에서 실행)
 # 실행 전 $env:SPRING_BOOT_URL="http://<노트북 IP>:8080" 으로 지정. 없으면 같은 컴퓨터(127.0.0.1)
-SPRING_BOOT_URL = os.getenv("SPRING_BOOT_URL", "http://127.0.0.1:8080").rstrip("/")
+SPRING_BOOT_URL = os.getenv("SPRING_BOOT_URL", "http://10.238.121.174:8080").rstrip("/")
 
 # 현재 Python 장비가 연결된 아파트 번호
 # 여러 아파트를 운영하면 장비별로 이 값을 바꿔서 사용
@@ -56,6 +56,6 @@ SPRING_API = {
 PLATE_MATCH_THRESHOLD = 2
 
 # 입구 통과 후 주차 확인 대기 시간 (분)
-GATE_CHECK_MINUTES = 10
+GATE_CHECK_MINUTES = 2
 
 AISLE_ZONES = ["a-b1-007", "a-b1-008", "a-b1-009"]
