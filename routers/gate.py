@@ -387,4 +387,9 @@ def remove_from_pending(plate: str):
             after  = len(pending_plates)
             if before != after:
                 print(f"[PENDING] {plate} 인식 성공 → 대기 목록 제거")
+        # 후보가 줄었으므로 역추적을 다시 시작한다 (번호 없는 차가 없으면 바로 끝남).
+        # 예전엔 역추적이 먼저 끝나 있으면 대기 목록에 1개만 남아도 번호 없는 차에 붙이지 않았음
+        # (2026-11-02 테스트: 7번 통로 차가 마지막 남은 24조2426을 못 받음)
+        if before != after and after > 0:
+            start_plate_assignment(zone="pending-removed", immediate=True)
     asyncio.create_task(_remove())

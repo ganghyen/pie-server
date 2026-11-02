@@ -56,6 +56,6 @@ SPRING_API = {
 PLATE_MATCH_THRESHOLD = 2
 
 # 입구 통과 후 주차 확인 대기 시간 (분)
-GATE_CHECK_MINUTES = 2
+GATE_CHECK_MINUTES = 4
 
 AISLE_ZONES = ["a-b1-007", "a-b1-008", "a-b1-009"]
